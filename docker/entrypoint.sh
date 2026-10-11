@@ -175,6 +175,11 @@ export ENABLE_SIM=1
 export ACCEPT_EULA=Y
 export OMNI_KIT_ACCEPT_EULA=Y
 [ -f /opt/ros/${ROS_DISTRO}/setup.bash ] && source /opt/ros/${ROS_DISTRO}/setup.bash
+# WSL2: route Mesa OpenGL through the D3D12 GPU driver (see start.sh).
+if [ -e /dev/dxg ] && [ -f /usr/lib/wsl/lib/libd3d12.so ]; then
+    export GALLIUM_DRIVER=d3d12
+    export LD_LIBRARY_PATH="\${LD_LIBRARY_PATH:+\${LD_LIBRARY_PATH}:}/usr/lib/wsl/lib"
+fi
 if [[ \$- == *i* ]]; then
     alias isaacsim='/isaac-sim/runapp.sh'
     command -v geniesim >/dev/null 2>&1 && eval "\$(geniesim completion bash)" 2>/dev/null || true

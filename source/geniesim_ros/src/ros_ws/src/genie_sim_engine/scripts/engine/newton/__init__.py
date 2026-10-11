@@ -10,6 +10,10 @@ concrete engine class.  For the Kit viewport with Newton physics, use
 internally.
 """
 
-from engine.newton.engine import NewtonHeadlessEngine
+from engine.newton._compat import install_control_aliases
+
+install_control_aliases()
+
+from engine.newton.engine import NewtonHeadlessEngine  # noqa: E402
 
 __all__ = ["NewtonHeadlessEngine"]

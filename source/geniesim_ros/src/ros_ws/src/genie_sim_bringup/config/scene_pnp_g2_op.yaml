@@ -7,7 +7,7 @@ robot:
     gripper: "omnipicker"
     robot_model: genie
     package: genie_sim_robot_model
-    pin_base_to_world: true   # keep URDF root_joint → use kinematic-control substep (stationary humanoid)
+    pin_base_to_world: false  # mobile base: wheels drive via /cmd_4ws
     convert_joints_to_fixed: []   # [base, head, body] to weld sub-trees; empty = keep all articulated
     urdf: {}
   init_base_pose:

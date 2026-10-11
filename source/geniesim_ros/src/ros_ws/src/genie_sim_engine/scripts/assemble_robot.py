@@ -1241,6 +1241,29 @@ def _apply_post_transformer_material_overrides(
     return n
 
 
+def _ensure_default_physics_variant(usd_path: str, variant: str = "physx", logger=None) -> bool:
+    """Select ``variant`` on the root prim's ``Physics`` variantSet if unset.
+
+    Returns True when a selection was authored. Idempotent: an existing
+    selection is left untouched.
+    """
+    from pxr import Sdf
+
+    layer = Sdf.Layer.FindOrOpen(usd_path)
+    if layer is None:
+        return False
+    root = layer.GetPrimAtPath(f"/{layer.defaultPrim or 'robot'}")
+    if root is None or "Physics" not in root.variantSets:
+        return False
+    if root.variantSelections.get("Physics"):
+        return False
+    root.variantSelections["Physics"] = variant
+    layer.Save()
+    if logger is not None:
+        logger.info(f"authored default variant selection Physics={variant!r} in {usd_path}")
+    return True
+
+
 def _apply_post_transformer_collision_policy(usd_path: str, logger=None) -> dict:
     """Run the selective collision policy AGAINST THE FINAL ``robot.usda``.
 
@@ -1566,6 +1589,14 @@ def _convert_urdf_to_usd_60(
         imported_root = os.path.join(usd_out_dir, f"{robot_name}.usda")
         if imported_root != usd_path and os.path.isfile(imported_root):
             os.replace(imported_root, usd_path)
+
+        # Author the default ``Physics = "physx"`` variant selection (see
+        # docs/asset_consumption.md). Some transformer versions emit the
+        # variantSet without a selection; then no Physics payload composes
+        # and the robot has no joints. Must run before the post-processing
+        # below, which opens robot.usda and walks its physics prims.
+        if os.path.isfile(usd_path):
+            _ensure_default_physics_variant(usd_path, logger=_local_logger)
 
         # Apply the selective collision policy AGAINST THE FINAL
         # robot.usda. Overrides authored here land in the robot.usda

@@ -125,6 +125,17 @@ if [ "${HEADLESS}" -eq 0 ]; then
         -v "${HOME}/.Xauthority:/home/isaac-sim/.Xauthority:ro"
         -v /dev/input:/dev/input:rw
     )
+    # WSL2 / Docker Desktop: the NVIDIA hook only injects the CUDA part of
+    # the driver. Mount the full WSL GPU stack so Mesa's d3d12 driver can
+    # hardware-accelerate OpenGL viewers (Newton GL) instead of llvmpipe.
+    # entrypoint.sh sets GALLIUM_DRIVER / LD_LIBRARY_PATH when it sees it.
+    if [ -e /dev/dxg ] && [ -d /usr/lib/wsl/lib ] && [ -d /usr/lib/wsl/drivers ]; then
+        RUN_ARGS+=(
+            --device /dev/dxg
+            -v /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
+            -v /usr/lib/wsl/drivers:/usr/lib/wsl/drivers:ro
+        )
+    fi
 fi
 
 docker run "${RUN_ARGS[@]}" "${IMAGE}" tail -f /dev/null >/dev/null
