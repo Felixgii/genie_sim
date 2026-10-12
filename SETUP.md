@@ -166,12 +166,20 @@ docker unpause geniesim3      # weitermachen (sofort, kein entrypoint)
    docker logs -f geniesim3         # warten bis GENIESIM_READY
    geniesim docker into
    source /workspace/devel/setup.bash
-
-
+   ```
+3. sim starten:
+   ```
    source /workspace/devel/setup.bash
-  export GALLIUM_DRIVER=d3d12 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/wsl/lib   # nur bis zum nächsten docker start nötig
-  ros2 launch genie_sim_bringup app.launch.py scene:=scene_pnp_g2_op \
-  launcher_config:=launcher_newton_mjwarp headless:=false physics_engine_visualizer:=newton
+   ros2 launch genie_sim_bringup app.launch.py scene:=scene_pnp_g2_op \
+   launcher_config:=launcher_newton_mjwarp headless:=false
+   physics_engine_visualizer:=newton
+   ```
+4. test nav satrten\_
+
+   ```
+   source /workspace/devel/setup.bash
+   python3 /workspace/Doku/drive_base.py
+
    ```
 
 ---
