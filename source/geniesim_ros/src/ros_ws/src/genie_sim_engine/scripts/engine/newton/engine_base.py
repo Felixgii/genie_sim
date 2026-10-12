@@ -303,6 +303,9 @@ class _NewtonStandaloneBase(
         # publisher (visualization_msgs/MarkerArray of every free-joint
         # body's pose).  Same on/off semantics.
         self._object_pub: Any = None
+        # ``newton.sensors.laser_scan`` — planar LaserScan raycast on the
+        # GPU (see laser_scan.py).  ``None`` when the block is absent.
+        self._laser_scan: Any = None
         # Sim-time of next debug-pub fire.  Both debug publishers share
         # this gate so they fire at ``render_hz`` (not physics_hz × subs).
         # See ``tick_extras`` for the advance step.
@@ -872,6 +875,15 @@ class _NewtonStandaloneBase(
                 # rather than letting the gate flood once it catches up.
                 period = 1.0 / _hz
                 self._next_debug_pub_time = max(self._next_debug_pub_time + period, self._sim_time_acc + period * 0.5)
+
+        # LaserScan: own wall-clock gate inside maybe_publish; same
+        # disarm-on-failure pattern as the debug pubs above.
+        if self._laser_scan is not None and self._state_0 is not None:
+            try:
+                self._laser_scan.maybe_publish(self._state_0)
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warn(f"[newton-standalone] laser_scan publish failed: {exc!r}")
+                self._laser_scan = None
 
     def attach_physics_event(self, event: Any) -> None:
         """Attach a ``wp.Event`` recorded after every physics step.

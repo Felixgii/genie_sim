@@ -58,3 +58,19 @@ cameras:
     wxyz: [1.0, 0.0, 0.0, 0.0]
 lidars: []
 scene: scenes/GDK/demo.usda
+
+# Newton-standalone only: planar LaserScan raycast against the collision
+# geometry on the GPU (no RTX).  See genie_sim_engine/scripts/engine/newton/laser_scan.py.
+newton:
+  sensors:
+    laser_scan:
+      enabled: true
+      topic: /scan
+      frame_id: base_scan          # static child of parent_frame
+      parent_frame: base_footprint
+      height: 0.3                  # [m] above ground
+      num_rays: 360
+      range_min: 0.0               # [m]; 0 = auto (dead-zone edge)
+      range_max: 10.0              # [m]
+      rate_hz: 10.0                # wall-clock
+      dead_zone_margin: 0.02       # [m] beyond the robot's own collision shapes

@@ -50,6 +50,9 @@ class _RuntimeMixin:
         self._phase_states_and_robot_solver()
         self._phase_cloth_solver_and_readback(cloth_entries, solver_pref, plugin_has_build)
         self._phase_debug_publishers()
+        from engine.newton.laser_scan import maybe_create_laser_scan  # noqa: PLC0415
+
+        self._laser_scan = maybe_create_laser_scan(self)
         self._phase_finalize_init_state()
 
     def _warmup(self) -> None:

@@ -158,6 +158,135 @@ Jeder Tick ist ein Render-Tick, die Physikrate hängt also an der Bildrate. Ein 
 **Test:** 6 s mit +3 rad/s, dann 6 s mit −3 rad/s → Radgeschwindigkeit 2,99 rad/s,
 Odometrie x: −0,200 → 0,021 → −0,177 m. Kurze Strecke wegen ~17 % Echtzeit.
 
+### B6 — 2D-Laserscan ohne RTX (2026-10-12)
+
+**Ziel:** `sensor_msgs/LaserScan` für Nav2 (Costmap) und einen späteren Learned Planner: 360°,
+~10 Hz, bis 10 m, 0,3 m über Boden. Der Scan soll die aktuelle Kollisionsgeometrie pro Step
+treffen, damit auch bewegte Objekte (später Fußgänger) erscheinen. Auf dem Newton-Pfad gibt es
+keine Kamera- oder Lidar-Topics, weil RTX hier nicht läuft (B1).
+
+**Grundlage (im installierten Paket geprüft):** Newton 1.5 exportiert in `newton/sensors.py`
+`SensorContact`, `SensorFrameTransform`, `SensorIMU` und `SensorTiledCamera`, aber kein Lidar.
+`SensorTiledCamera` ist ein Warp-Raytracer (nur CUDA). Er liefert `depth` (Trefferabstand) und
+`shape_index`. Strahlursprung und -richtung lassen sich pro Pixel frei vorgeben. Ein 1×360-„Bild“
+mit horizontalen Strahlen ergibt damit einen Laserscan. Getroffen werden die Shapes der
+Modell-BVH (`Model.bvh_build_shapes(shape_flags=...)`). `Model.bvh_refit_shapes(state)` passt sie
+an die aktuellen `body_q` an.
+
+**Umsetzung:** neues Modul
+[laser_scan.py](../source/geniesim_ros/src/ros_ws/src/genie_sim_engine/scripts/engine/newton/laser_scan.py)
+im Engine-Prozess. Ein separater Node käme an die GPU-Zustände nicht heran, und die Posen der
+Szenenobjekte werden nicht publiziert. Es folgt dem Muster der bestehenden Debug-Publisher:
+- **Schalter:** Block `newton.sensors.laser_scan` in der Szene-YAML. Ohne den Block wird das
+  Modul nicht geladen.
+- **Einhängepunkte:** Erzeugung in `setup/runtime.py`, Aufruf pro Tick in `tick_extras`
+  (`engine_base.py`).
+
+Details:
+- BVH neu gebaut mit `ShapeFlags.COLLIDE_SHAPES`: Der Scan sieht Kollisions-, nicht Render-Geometrie.
+- Scanner-Pose = `base_link`-Pose auf den Boden projiziert (x, y, Yaw) plus `height`. Das ist
+  dieselbe Projektion, mit der die Engine `odom → base_footprint` publiziert. Neuer statischer
+  Frame `base_footprint → base_scan` (z = 0,3 m).
+- Takt 10 Hz nach **Wanduhr**, Stempel = Wanduhr wie bei den übrigen Engine-Topics. Mit
+  Sim-Zeit-Takt kämen bei RTF ≈ 0,18 nur ~1,8 Hz an.
+- Eigentreffer: Beim ersten Scan wird jeder Strahl, der zuerst den Roboter trifft, hinter
+  dessen Collider gestartet (+2 cm). Spätere Roboter-Treffer (z.B. ein Arm in der Ebene) werden
+  als „kein Echo“ (+inf) gemeldet.
+- Parameter (YAML): `topic`, `frame_id`, `parent_frame`, `height`, `num_rays`, `range_min`
+  (0 = automatisch), `range_max`, `rate_hz`, `dead_zone_margin`. QoS: Sensor-Data (Best Effort).
+- Diagnose: `GENIESIM_LASER_SCAN_DEBUG=1` listet einmalig alle treffbaren Shapes mit
+  Welt-AABB, dazu die Roboter-Collider in Bodennähe.
+
+**Gefundene Lücke in Newton 1.5 (Workaround im Modul):** Der Raytracer nimmt den
+Mesh-Schnitt-Pfad nur für `GeoType.MESH`. Alle anderen Typen gehen an
+`raycast.ray_intersect_shape`, das laut Docstring nur Primitive behandelt. Konvexe Hüllen
+(`CONVEX_MESH`, der übliche USD-Collider, z.B. die Flaschen) werden deshalb **nie getroffen**.
+Newton macht für `HFIELD` bereits dasselbe Remapping. Das Modul gibt dem Raytracer ein eigenes
+Typ-Array, in dem `CONVEX_MESH` als `MESH` geführt wird. `model.shape_type`, das die Kollision
+nutzt, bleibt unverändert. Der Workaround greift auf ein privates Attribut zu
+(`_SensorTiledCamera__render_context`). Fehlt es in einer späteren Newton-Version, gibt das Modul
+eine Warnung aus und läuft ohne konvexe Hüllen weiter. Außerdem gilt: Fehlschüsse haben
+`depth = 0.0` (Default-`ClearData`), nicht negativ wie im Docstring beschrieben. Das Modul
+erkennt sie deshalb am `shape_index`.
+
+**Kollisionsgeometrie auf 0,3 m (wichtig für die Interpretation):**
+- **Szene `scene_pnp_g2_op`:** Auf Scan-Höhe gibt es **keinen** Collider. Vom Regal
+  `supermarket_shelf_002` sind nur die vier Böden Collider (z = 0,09–0,14 / 0,54–0,59 / 0,99–1,04 /
+  1,43–1,48 m), dazu Flaschen ab 1,05 m und der Boden. Es gibt keine Wände und keinen Tisch. Der Scan
+  zeigt in der Originalszene deshalb überall +inf, und das ist korrekt.
+- **Roboter:** Im unteren Bereich hat er nur die vier Radzylinder (z = 0–0,14 m,
+  x ≈ −0,30…+0,30 m und y ≈ ±0,24 m um `base_link`) und `body_link2` (ab 0,48 m) als Collider.
+  **Zwischen 0,14 und 0,48 m hat das Chassis keine Kollisionsgeometrie.**
+- **Toter Bereich:** vorne / links / hinten / rechts jeweils **0,0 cm**. Die Strahlen starten im
+  Scanner-Zentrum, und es gibt keine Eigentreffer. So steht es auch im Log
+  (`laser_scan: dead zone (none -- no robot collider at scan height ...)`). Bekommt der Roboter
+  später Collider auf Scan-Höhe, wird der tote Bereich beim Start automatisch berechnet und
+  geloggt.
+
+**Testaufbau:** temporär, nur in der WSL-Kopie, danach wieder entfernt:
+- Zwei statische Wände über den vorhandenen Mechanismus `newton.entries` (`kind: box`):
+  Innenfläche vorne bei x = 1,75 m, links bei y = 1,45 m.
+- [scan_test_plugin.py](scan_test_plugin.py) als Scene-Plugin. Es führt die freie Flasche
+  `iros_beverage_bottle_002` kinematisch auf 0,3 m Höhe neben dem Roboter entlang y = −2,5 … −0,8 m
+  (Sinus, 6 s Sim-Zeit), indem es `joint_q`/`body_q` nach jedem Step schreibt.
+
+Ein Plugin mit `on_build` hätte sich angeboten, aber dann verlangt die Engine einen
+Partikel-Solver (`setup/model.py`).
+
+**Testergebnisse:**
+
+| Test | Ergebnis |
+|---|---|
+| `ros2 topic hz /scan` | 9,98 Hz (Fenster 12–22 Scans) |
+| Typ / Frame | `sensor_msgs/msg/LaserScan`, `frame_id: base_scan`, 360 Strahlen, `range_max` 10 m; TF `base_footprint → base_scan` = (0, 0, 0,300) |
+| Bekannte Abstände, Roboter am Start (x = −0,2) | 0°: 1,950 m (soll 1,75 − (−0,2) = 1,950) · +90°: 1,450 m (soll 1,450) |
+| Fahrt auf die Wand zu (`/cmd_4ws`, 10 rad/s) | r(0°) 1,950 → 1,449 m, Abweichung zu 1,75 − x_odom: ±0,7 mm im Stand, max. −7 mm während der Fahrt (Abtastversatz Scan/Odom) |
+| Bewegtes Objekt (20 Proben über 1,5 Hübe) | Range bei −90° folgt der Sollposition über 0,77–2,46 m, Abweichung meist 2 mm, max. 11 mm. Bei 0,8 m treffen 3 Strahlen die 5 cm breite Flasche, ab ~1,8 m einer |
+| Drehung (Yaw −157°) | Scanpunkte im `odom`-Frame (über TF) liegen weiter exakt auf der Wandfläche, das Yaw-Vorzeichen ist also korrekt |
+| RViz | LaserScan-Display (Best Effort) subskribiert, keine TF-/Drop-Meldungen im RViz-Log. Einen Screenshot erlaubt WSLg nicht (XWayland verweigert `GetImage`). Ersatz: eigene Draufsicht `/scan` in `odom` über TF, Punkte deckungsgleich mit Wänden und Flasche |
+
+**Echtzeitfaktor** (je 30 s `/rtf`, ~500 Werte, Roboter im Stillstand, GL-Fenster offen):
+
+| Lauf | /rtf Mittel (Median) | Render | `tick_extras` |
+|---|---|---|---|
+| Vorher (Original, ohne Modul) | 0,1795 (0,1846) | ~53 ms | – |
+| A/B mit Testwänden: Scan an | 0,1796 (0,1833) | 44,5 ms | 10,0 ms |
+| A/B mit Testwänden: Scan aus (`enabled: false`) | 0,1856 (0,1901) | 52,7 ms | 0,01 ms |
+| Nachher (Endzustand, Scan an) | 0,1811 (0,1852) | 44,6 ms | 9,4 ms |
+
+Ein Effekt ist **nicht von der Streuung zwischen Läufen zu unterscheiden**: Zwei Läufe ohne Scan
+lagen bei 0,1795 und 0,1856. Der Scan kostet ~10 ms pro Tick in `tick_extras`, Render wird im
+Gegenzug ~8 ms schneller. Das Zurücklesen (`numpy()`) synchronisiert die GPU und wartet dabei
+größtenteils auf Arbeit, auf die sonst der Render-Schritt gewartet hätte. Falls das später
+stört, wäre ein asynchrones Zurücklesen wie in `async_mirror.py` möglich. Dann käme der Scan
+einen Tick später.
+
+**Grenzen:**
+- Kein Sensorrauschen, keine Strahlaufweitung, keine Intensitäten, keine Bewegungsverzerrung
+  innerhalb eines Scans (alle 360 Strahlen zum selben Zeitpunkt).
+- Nur Kollisionsgeometrie. Visuelle Details ohne Collider sieht der Scan nicht.
+- Echte 2D-Ebene: Alles über oder unter 0,3 m ist unsichtbar. Beim Fahrtest blieb der Roboter
+  nach 0,5 m am untersten Regalboden hängen (z = 0,09–0,14 m), den der Scan prinzipbedingt nicht
+  sieht. Für die Nav2-Costmap fehlt dieses Hindernis also.
+- Eine einzige BVH pro Modell: Eine spätere Depth-Kamera mit `SensorTiledCamera` sähe ebenfalls
+  nur Kollisionsgeometrie, solange der Scan aktiv ist.
+- Der Workaround für konvexe Hüllen hängt an einem privaten Newton-Attribut (siehe oben).
+
+**Nebenbefunde (nicht behoben):**
+- **Roboter fährt durch Testwand:** Bei der Rückwärtsfahrt mit Lenkeinschlag fuhr der Roboter
+  durch die statische Testbox (`newton.entries`, `kind: box`), obwohl das Log „collision-group
+  unification … can collide“ meldet. Nicht untersucht. Das ist relevant, sobald Fußgänger
+  physisch mit dem Roboter interagieren sollen.
+- **Veraltete Scene-Caches:** `assemble_scene.py` schreibt `newton_scene.usda` und
+  `newton_solvers.json` in `/geniesim_assets/scenes/<scene>/` nur, wenn `newton.entries`
+  existiert, löscht sie aber nicht, wenn die Einträge wieder entfernt werden. Die Engine lädt die
+  alte Datei weiter (`setup/stage.py:571`). Die Test-Artefakte wurden danach von Hand gelöscht.
+- **Testshell:** `docker exec … bash -c` liest `/etc/profile.d/geniesim.sh` nicht. Ohne
+  `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` und `CYCLONEDDS_URI` (Loopback, kein Multicast) sieht
+  man zwar Topics über den Daemon (`ros2 topic list`), bekommt aber keine Daten. So kamen
+  anfangs keine Werte auf `/rtf`, und `tf2_echo` fand `base_link` nicht. Lösung: Login-Shell
+  `docker exec -u isaac-sim geniesim3 bash -lc '…'` bzw. `geniesim docker into`.
+
 ---
 
 ## Anhang: Betrieb
@@ -185,6 +314,9 @@ Beim ersten Start kompiliert Warp die CUDA-Kernel (mehrere Minuten, danach gecac
 | `ddsi_udp_conn_write ... retcode -3` | CycloneDDS-Discovery an leere Loopback-Ports | harmlos |
 | Kein Isaac-Sim-Fenster | Folge von B1 | Newton-GL-Viewer |
 | Python-Änderung ohne Wirkung? | – | Skripte sind per Symlink installiert, kein Rebuild nötig. Neue Dateien brauchen einen Symlink in `devel/` bzw. `geniesim ros build dev` |
+| Topics sichtbar, aber keine Daten (`ros2 topic echo` stumm, `tf2_echo`: frame does not exist) | `docker exec … bash -c` ist keine Login-Shell, DDS-Umgebung aus `/etc/profile.d/geniesim.sh` fehlt (B6) | `docker exec -u isaac-sim geniesim3 bash -lc '…'` oder `geniesim docker into` |
+| Entfernte `newton.entries` wirken weiter | Veraltete `newton_scene.usda`/`newton_solvers.json` im Scene-Cache (B6) | Dateien in `/geniesim_assets/scenes/<scene>/` löschen |
+| Änderungen auf D: kommen im Container nicht an | Container mountet die WSL-Kopie `~/genie_sim`, nicht das Git-Repo auf D: | Dateien kopieren und **nach LF konvertieren** (D: hat CRLF durch `autocrlf`) |
 
 ### Geänderte Dateien
 
@@ -195,6 +327,11 @@ Beim ersten Start kompiliert Warp die CUDA-Kernel (mehrere Minuten, danach gecac
 | `docker/start.sh`, `docker/entrypoint.sh` | WSL-GPU-Mounts, `GALLIUM_DRIVER=d3d12` (B4); Mounts greifen erst nach `geniesim docker down && up` |
 | `source/geniesim_ros/.../config/scene_pnp_g2_op.yaml` | `pin_base_to_world: false` (B5) |
 | `Doku/drive_base.py` (neu) | Tastatur-Teleop |
+| `source/geniesim_ros/.../scripts/engine/newton/laser_scan.py` (neu) | 2D-Laserscan (B6) |
+| `source/geniesim_ros/.../scripts/engine/newton/engine_base.py`, `setup/runtime.py` | Einhängepunkte Laserscan (B6, je wenige Zeilen) |
+| `source/geniesim_ros/.../config/scene_pnp_g2_op.yaml` | Block `newton.sensors.laser_scan` (B6) |
+| `source/geniesim_ros/.../genie_sim_engine/AGENTS.md` | Datei-Layout um `laser_scan.py` ergänzt |
+| `Doku/scan_test_plugin.py` (neu) | Test-Plugin bewegtes Objekt (B6), nur temporär aktiv |
 
 Backups in WSL: `~/genie_sim_crlf_backup_2026-10-11.tar.gz`, `~/assemble_robot.py.orig_2026-10-11`,
 `~/genie_sim_orig_2026-10-11/`, `~/genie_sim/scene_pnp_g2_op.yaml.bak_2026-10-11`.

@@ -29,6 +29,7 @@ scripts/
 │   └── newton/      # newton-standalone implementation (Kit-free)
 │       ├── engine.py        # NewtonHeadlessEngine — the only concrete subclass
 │       ├── engine_base.py   # _NewtonStandaloneBase: mixin composition + shared init
+│       ├── laser_scan.py    # optional 2D LaserScan via Newton's Warp raytracer (scene yaml newton.sensors.laser_scan)
 │       ├── setup/           # build-phase mixins (stage / model / normalize / solver / debug_pubs / init_pose / runtime)
 │       └── visualizers/     # RViz markers (DeformableMarker, DeformablePointCloud, ObjectMarker) + InlineOvrtxVisualizer
 ├── genie_sim_engine_isaacsim.py
