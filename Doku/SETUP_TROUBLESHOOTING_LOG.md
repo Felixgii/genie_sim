@@ -485,6 +485,121 @@ python3 $T/scan_check.py               # nur mit B6-Testwänden sinnvoll
 hängt weitere Launch-Argumente an. Phasen-Aufschlüsselung:
 `grep -E "Interval:|Solver:|Extras:" /tmp/rtfbench/launch_<tag>.log`.
 
+### B9 — Odometrie vs. Ground Truth: /odom ist die Sim-Pose, aber verzögert bei GPU-Rückstand (Analyse, 2026-10-13)
+
+**Frage:** Ist `/odom` echte Odometrie (Rad-Integration mit Drift) oder die Körperpose der Sim?
+Was steckt in `map → odom`? Welche Quelle dient als Ground Truth für die Metriken (Pfadlänge,
+Abstände zu Fußgängern)?
+
+**Befund aus dem Code — `/odom` ist Ground Truth, keine Odometrie:**
+- [loop.py:94](../source/geniesim_ros/src/ros_ws/src/genie_sim_engine/scripts/common/loop.py#L94)
+  ruft pro Physik-Tick `sim.get_odom()` und übergibt das Ergebnis an `publish_odom`.
+- [state.py:337](../source/geniesim_ros/src/ros_ws/src/genie_sim_engine/scripts/engine/newton/state.py#L337)
+  `get_odom` liest `body_q[base_link]`, also die Weltpose des Körpers aus dem Physikzustand
+  (über `_bq_mirror`, Z. 371). Es gibt keine Radgeschwindigkeiten und keine Integration.
+  Der Twist wird per Differenzenquotient aus zwei Posen gebildet, nur linear. **`angular.z` ist
+  immer 0** (Z. 402: „Angular velocity: omitted“). Die Kovarianzen sind 0.
+- [realtime_ros_node.cpp:234](../source/geniesim_ros/src/ros_ws/src/genie_sim_engine/src/realtime_ros_node.cpp#L234)
+  `publish_odom` projiziert die Pose auf den Boden (x, y, Gier → `odom → base_footprint`) und
+  publiziert den Rest (Höhe, Roll/Nick) als `base_footprint → base_link`. `/odom` und
+  TF-Kante tragen dieselben Zahlen und denselben Stempel (Wanduhr `now()`).
+- **`map → odom`** (Z. 361): Wenn `fake_slam` gesetzt ist, publiziert die Engine bei jedem Tick
+  die Identität. `fake_slam` ist im Bringup per Default `true`
+  ([utils.py:392](../source/geniesim_ros/src/ros_ws/src/genie_sim_bringup/launch/utils.py#L392)).
+  `world → map` ist statisch Identität (Z. 79–87). Damit gilt: odom = map = world = Newton-Welt.
+- `/tf_render` (Frame `map`) liefert alle Körperposen aus demselben `_bq_mirror` im selben
+  Tick, `base_link` also mit voller 3D-Pose. **Eine davon unabhängige „echtere“ Quelle gibt es
+  über ROS nicht.** Exakt sim-zeitsynchron ist nur `state_0.body_q` im Engine-Prozess
+  (z. B. über den Plugin-Hook `on_post_step`, [engine_base.py:497](../source/geniesim_ros/src/ros_ws/src/genie_sim_engine/scripts/engine/newton/engine_base.py#L497)).
+
+**Befund aus der Messung — veraltete Samples durch den AsyncMirror:** Mit `async_mirror.py`
+liest der Publish-Pfad den Ping-Pong-Slot des Vortick. Ob die Kopie dort schon gelandet ist,
+prüft er nicht, sondern verlässt sich auf „wall-time separation“
+([async_mirror.py:78](../source/geniesim_ros/src/ros_ws/src/genie_sim_engine/scripts/engine/newton/async_mirror.py#L78)).
+Beim **Drehen und in Kurven** braucht ein Physikschritt (Nav-Launcher, 5 Substeps) aber
+**11–12 ms GPU-Zeit** (max. 15,5 ms), geradeaus und im Stand ~7,4 ms (gemessen mit
+`GENIESIM_STEP_GPU_SYNC=1`). Die CPU-Schleife hält ohne Sync trotzdem exakt 10,00 ms ein
+(`Interval mean=10.00`), die GPU-Physik fällt zurück. Folgen:
+- `/odom` springt einzeln **einen Tick zurück** (Slot noch mit Daten von vor 3 Ticks) und holt
+  das später mit 3-fach-Sprüngen auf. Der Engine-Twist zeigt dann −0,6 bzw. das falsche
+  Vorzeichen statt 0,2 m/s.
+- Die publizierte Pose läuft **bis ~0,37 s hinter ihrem Stempel her**. Geschätzt aus dem
+  Überschwingen nach dem Stopp: Drehung 12,6° statt 2,7° bei 0,46 rad/s, Kurve 8,3° statt
+  2,4° bei 0,29 rad/s, jeweils ohne / mit Sync. Im Stand baut sich der Rückstand wieder ab,
+  die **Endposen stimmen**.
+- Der von `/rtf` angezeigte RTF ≈ 1 (B8) gilt für die CPU-Schleife. Die Physik selbst läuft beim
+  Drehen effektiv mit ~0,8 (mit Sync: 77–81 Schritte/s).
+
+**Messung** ([odom_check.py](tools/odom_check.py)): Nav-Launcher, Servo, jeder Lauf ab frischem
+Sim-Start. Fahrt: 1 m geradeaus (rückwärts), +90° drehen, 0,3 m geradeaus, Kurve 90°
+(vx 0,15, wz 0,3), 0,5 m seitwärts, zurück zum Start (drehen, geradeaus, drehen). Die ganze
+Route liegt hinter dem Start (x < −0,2). Grund: Die Regalfront steht bei x = 0,6, die Greifer
+reichen in der Startpose bis x ≈ 0,58. Am Start daher weder vorwärts fahren noch drehen.
+Not-Stopp bei x > −0,15. Ca. 60 s, ~4,2 m, ~360° Drehung. Referenz ist `/odom`. Die anderen
+Quellen werden am selben Tick verglichen (TF per tf2-Lookup am `/odom`-Stempel, `/tf_render`
+nächster Stempel < 5 ms). Rad-Odometrie = im Tool aus `/joint_states` integriert
+(Lenkwinkel + Radgeschwindigkeit, Least Squares über 4 Räder, Sim-Zeit), als Vergleich für eine
+echte Odometrie.
+
+| Abweichung zu `/odom` (Ende / max) | Lauf 2: normal | Lauf 3: `GENIESIM_STEP_GPU_SYNC=1` |
+|---|---|---|
+| TF `map → base_footprint` (= `world → …`) | 0,0 mm, 0,00° / 5,5 mm, 0,34° | 0,0 mm, 0,00° / 4,3 mm, 0,09° |
+| `/tf_render` `base_link` | 0,0 mm, 0,00° / 4,0 mm, 0,53° | 0,0 mm, 0,00° / 0,0 mm, 0,00° |
+| Rad-Odometrie (integriert) | 574 mm, 25,2° / 574 mm, 25,5° | **104 mm, 4,9°** / 104 mm, 5,0° |
+| `map → odom` | exakt Identität (5792 Nachr.) | exakt Identität |
+| Rücksprünge in `/odom` (xy / Gier) | 134 / 51 von 3668 Samples in Bewegung | 0 / 0 |
+| `/odom`-Twist max \|vx\| (Soll 0,2) / max \|wz\| | 0,600 / 0,000 m/s, rad/s | 0,200 / 0,000 |
+| Drehung „+90°“ (Stopp bei 87°) endet bei | 99,6° | 89,7° |
+| Pfadlänge aus `/odom` 100 Hz / 10 Hz | 4,66 / 4,24 m (+10 % Zickzack) | 4,15 / 4,14 m |
+| Wanduhr / Sim-Zeit | 65 / 63,2 s | 60 / 54,7 s |
+
+Lauf 1 (wie Lauf 2, Tool noch mit `spin_once`) ergab praktisch dieselben Werte (Rad-Odometrie
+586 mm / 25,4°). Rad-Odometrie im Detail, Lauf 3: 1 m geradeaus 0,0 mm, 90° drehen +1,3° (1,5 %),
+Kurve +0,3°, 166° drehen +2,7° (1,6 %). Das ist der Schlupf, den eine echte Odometrie hier
+hätte. Ohne Sync sind es 9,2° pro 90°. Davon ist der größte Teil ein Messartefakt: Veraltete
+Radgeschwindigkeiten werden mehrfach über die Sim-Uhr integriert. Die Rest-Abweichungen von TF
+und `/tf_render` (wenige mm) sind Zeitzuordnung: TF wird von tf2 über ausgelassene
+`/tf`-Nachrichten interpoliert (der Realtime-Publisher verwirft bei `trylock`), `/tf_render`
+und `/odom` lesen den Mirror nacheinander. Mit Sync kamen nur 1517 statt ~5500
+`map → odom`-Nachrichten an (~28 Hz). Die Ursache ist nicht untersucht, der tf2-Lookup lief
+trotzdem.
+
+**Empfehlung Ground Truth:** `/odom` bzw. TF `map → base_footprint` (identisch, Abweichung 0
+bei passendem Stempel). Das ist die Körperpose der Sim, nicht driftbehaftet. Für 3D oder
+andere Körper (z. B. simulierte Fußgänger als Newton-Körper): `/tf_render`, gleiche Quelle,
+gleicher Tick. Bedingungen:
+1. Kein GPU-Rückstand während der Messung, sonst ist die Pose bis ~0,4 s älter als ihr Stempel.
+   Kontrolle: `odom_check.py` meldet die Rücksprünge, Soll 0. Sicher ist
+   `GENIESIM_STEP_GPU_SYNC=1` (Physik wird dann langsamer statt verzögert, RTF ~0,8 beim
+   Drehen). Eine saubere Lösung wäre ein Event-Check im `AsyncMirror` (Code-Änderung, offen).
+2. Pfadlänge nicht aus Roh-100-Hz-Samples, sondern unterabgetastet (≤ 10 Hz) oder mit Sync.
+3. Abstände zu Fußgängern aus Posen **desselben Ticks** bilden (gleicher Publisher bzw.
+   `/tf_render`-Nachricht), nicht über Wanduhr-Stempel aus verschiedenen Prozessen paaren.
+
+**Nav2 mit `/odom`:** geht direkt (Frames `odom`/`base_footprint`, TF-Kette vollständig). Nav2
+lokalisiert damit perfekt (Ground Truth, keine Drift). Das ist für einen Planer-Vergleich
+üblich, sollte aber in der Arbeit stehen. Zu beachten:
+- `twist.angular.z` ist immer 0. Nutzt der Controller die Odom-Geschwindigkeit (MPPI-
+  Startzustand, `velocity_smoother` mit `feedback: CLOSED_LOOP`), fehlt die Drehrate.
+  `OPEN_LOOP` beim Smoother umgeht das. Den Twist zu füllen wäre eine Code-Änderung (offen).
+- Bei GPU-Rückstand sieht Nav2 die Pose bis ~0,4 s zu spät, beim Drehen überschwingt es dann
+  (hier ~10°). Siehe Bedingung 1.
+- Wenn später AMCL/SLAM `map → odom` liefert, `fake_slam:=false` setzen, sonst gibt es zwei
+  Publisher derselben Kante.
+
+**Aufruf** (Sim + Servo laufen, Roboter in Startpose x = −0,2, Gier 0, sonst bricht das Tool ab):
+```bash
+T=/workspace/Doku/tools
+bash -l $T/rtf_sim.sh stop
+GENIESIM_STEP_GPU_SYNC=1 LAUNCHER=launcher_newton_mjwarp_nav bash -l $T/rtf_sim.sh start odom   # Sync optional
+source /workspace/devel/setup.bash
+ros2 run genie_sim_controllers genie_sim_chassis_servo_node --ros-args -r __node:=servo_node \
+  --params-file $(ros2 pkg prefix genie_sim_controllers)/share/genie_sim_controllers/config/genie_g2.yaml &
+python3 $T/odom_check.py         # Fahrt ~60 s → Tabellen + /tmp/odomcheck/odom_check.csv
+python3 $T/odom_check.py --dry   # nur 5 s Stand aufzeichnen
+```
+Der Servo startet mit `app.launch.py` nur bei `teleop:=true` oder `navigation:=true`.
+
 ---
 
 ## Anhang: Betrieb
@@ -539,6 +654,7 @@ Beim ersten Start kompiliert Warp die CUDA-Kernel (mehrere Minuten, danach gecac
 | `source/geniesim_ros/.../genie_sim_bringup/config/launcher_newton_mjwarp_nav.yaml` (neu) | Nav-Launcher mit `physics_solver_substep: 5` (B8); in WSL zusätzlich Symlink in `devel/share/genie_sim_bringup/config/` |
 | `source/geniesim_ros/.../scripts/engine/newton/laser_scan.py` | asynchroner Scan-Readback (B8) |
 | `Doku/tools/` (neu) | Mess- und Prüfskripte `rtf_sim.sh`, `rtf_measure.py`, `drive_check.py`, `scan_check.py` (B8) |
+| `Doku/tools/odom_check.py` (neu) | Odometrie- / Ground-Truth-Vergleich mit Testfahrt (B9) |
 
 Backups in WSL: `~/genie_sim_crlf_backup_2026-10-11.tar.gz`, `~/assemble_robot.py.orig_2026-10-11`,
 `~/genie_sim_orig_2026-10-11/`, `~/genie_sim/scene_pnp_g2_op.yaml.bak_2026-10-11`,
