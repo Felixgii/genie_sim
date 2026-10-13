@@ -227,3 +227,17 @@ class AsyncMirror:
         if not self.ok:
             return None
         return self._views[self._next_writer]
+
+    def read_latest(self) -> Optional[np.ndarray]:
+        """Return the slot the most recent ``refresh`` wrote (this tick's data).
+
+        Only valid when the caller has synchronized the device after that
+        refresh (``sim_time_stamps`` forces ``GENIESIM_STEP_GPU_SYNC``):
+        then the copy has landed and the data belongs to the step that was
+        just taken, so it can carry that step's sim_time as its stamp.
+        Without the sync this may return a half-written slot -- use
+        :meth:`read`.  ``None`` while warming up, like :meth:`read`.
+        """
+        if not self.ok:
+            return None
+        return self._views[1 - self._next_writer]

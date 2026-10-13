@@ -24,6 +24,13 @@ import warp as wp
 
 
 class _StateMixin:
+    def _mirror_read(self, mirror: Any) -> Optional[np.ndarray]:
+        """This tick's slot with ``sim_time_stamps`` (step is GPU-synced, so
+        the data matches the step's sim_time), else the previous tick's slot."""
+        if getattr(self, "_sim_time_stamps", False):
+            return mirror.read_latest()
+        return mirror.read()
+
     def get_joint_states(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return (positions, velocities) for ``self.joint_names``.
 
@@ -78,8 +85,8 @@ class _StateMixin:
             # meaning, while the split fields show which layer is
             # actually slow.
             t0 = time.monotonic()
-            jq = self._jq_mirror.read()
-            jqd = self._jqd_mirror.read()
+            jq = self._mirror_read(self._jq_mirror)
+            jqd = self._mirror_read(self._jqd_mirror)
             t_read = (time.monotonic() - t0) * 1000.0
             t_fb0 = time.monotonic()
             n_fallback = 0
@@ -213,7 +220,7 @@ class _StateMixin:
         if self._state_0 is None or getattr(self._state_0, "body_q", None) is None or not self._body_paths:
             return np.zeros((0, 7), dtype=np.float64), []
         try:
-            body_q = self._bq_mirror.read()
+            body_q = self._mirror_read(self._bq_mirror)
             if body_q is None:
                 body_q = self._state_0.body_q.numpy()
         except Exception as exc:
@@ -368,7 +375,7 @@ class _StateMixin:
         if base_idx is None or base_idx < 0:
             return None
         try:
-            body_q = self._bq_mirror.read()
+            body_q = self._mirror_read(self._bq_mirror)
             if body_q is None:
                 body_q = self._state_0.body_q.numpy()
         except Exception:

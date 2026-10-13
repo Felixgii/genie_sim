@@ -272,7 +272,8 @@ def generate_launch_description():
         )
 
         # ---- common args ------------------------------------------------
-        use_sim_time = lu.perform(context, "use_sim_time")
+        # Derived from the launcher's sim_time_stamps unless given on the CLI.
+        use_sim_time = lu.effective_use_sim_time(context, _plug_yaml, warn=True)
         launch_robot_model = lu.perform(context, "robot_model")
         launch_body = lu.perform(context, "body")
         launch_arm = lu.perform(context, "arm")

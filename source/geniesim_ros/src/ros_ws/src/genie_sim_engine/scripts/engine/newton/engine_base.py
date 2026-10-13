@@ -211,6 +211,11 @@ class _NewtonStandaloneBase(
         # to the scene plugin's on_post_step / on_render hooks so they can
         # phase a controller without re-reading the host clock.
         self._sim_time_acc: float = 0.0
+        # ``sim_time_stamps`` (launcher param, see enable_sim_time_stamps):
+        # every published stamp is the sim_time of the step the data comes
+        # from.  ``_sim_steps`` keeps that time on the exact dt grid.
+        self._sim_time_stamps: bool = False
+        self._sim_steps: int = 0
         # Render-mode choice — forwarded to ``configure_viewport_for_debug``
         # after _build/_warmup so the live viewport agrees with the
         # bootstrap-time kit args. See ``runtime.bootstrap.RENDER_MODE_MAP``
@@ -492,7 +497,11 @@ class _NewtonStandaloneBase(
         # graph (post the substep loop) so it can do host-side work like
         # state-machine updates and writing the next frame's kinematic
         # body poses.  See plugin.py for the contract.
-        self._sim_time_acc += dt
+        if self._sim_time_stamps:
+            self._sim_steps += 1
+            self._sim_time_acc = self._sim_steps * dt
+        else:
+            self._sim_time_acc += dt
         self._call_plugin(
             "on_post_step",
             self._state_0,
@@ -880,10 +889,32 @@ class _NewtonStandaloneBase(
         # disarm-on-failure pattern as the debug pubs above.
         if self._laser_scan is not None and self._state_0 is not None:
             try:
-                self._laser_scan.maybe_publish(self._state_0)
+                self._laser_scan.maybe_publish(
+                    self._state_0, self._sim_time_acc if self._sim_time_stamps else None
+                )
             except Exception as exc:  # noqa: BLE001
                 self._logger.warn(f"[newton-standalone] laser_scan publish failed: {exc!r}")
                 self._laser_scan = None
+
+    def enable_sim_time_stamps(self) -> None:
+        """Stamp everything with the sim_time of its physics step.
+
+        Forces the per-step device sync (``GENIESIM_STEP_GPU_SYNC``): only
+        then are the async mirrors' copies landed when ``step`` returns, so
+        state reads can take this step's slot (``read_latest``) and the
+        data really is the state at ``sim_time`` (B9: without the sync the
+        GPU falls behind on turns and poses lag their stamp by up to
+        ~0.37 s).  Must be called before ``startup``.
+        """
+        self._sim_time_stamps = True
+        self._step_gpu_sync = True
+        if self._laser_scan is not None:
+            self._logger.info("[newton-standalone] laser_scan: rate gate + stamps in SIM time (sim_time_stamps)")
+
+    @property
+    def sim_time(self) -> float:
+        """Sim time after the last ``step`` (the stamp of its data)."""
+        return self._sim_time_acc
 
     def attach_physics_event(self, event: Any) -> None:
         """Attach a ``wp.Event`` recorded after every physics step.

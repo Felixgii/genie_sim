@@ -526,6 +526,9 @@ class EngineNodeParams:
     render_hz: float = 0.0  # 0.0 → use PhysicsParams.render_target_hz
     realtime_factor: float = 1.0  # 1.0 = realtime; 0.1 = 10× slower; >1 = faster-than-real
     fake_slam: bool = False
+    # Stamp every message with the sim_time of its physics step and force the
+    # per-step GPU sync (newton-standalone only; set in the nav launcher).
+    sim_time_stamps: bool = False
     physics_params_file: str = ""
     physics_solver: str = ""  # "" → engine default
     render_mode: str = "raster"
@@ -569,6 +572,7 @@ class EngineNodeParams:
             render_hz=_float("render_hz", 0.0),
             realtime_factor=max(1e-6, _float("realtime_factor", 1.0)),
             fake_slam=_bool("fake_slam"),
+            sim_time_stamps=_bool("sim_time_stamps"),
             physics_params_file=str(params.get("physics_params_file", "") or ""),
             physics_solver=str(params.get("physics_solver", "") or "").strip().lower(),
             render_mode=str(params.get("render_mode", "raster") or "raster").strip().lower(),

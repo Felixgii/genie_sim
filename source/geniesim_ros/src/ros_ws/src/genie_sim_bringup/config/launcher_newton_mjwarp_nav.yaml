@@ -81,6 +81,17 @@ genie_sim_engine_newton:
     realtime_factor: 1.0
     physics_hz: 100.0
 
+    # NAV VARIANT: sim-time stamps.  Every header stamp (/tf, /odom,
+    # /joint_states, /tf_render, /scan) is the sim_time of the physics step
+    # the data comes from; /clock is published every step, after that
+    # step's data.  Forces the per-step GPU sync (GENIESIM_STEP_GPU_SYNC),
+    # so a pose really is the state at its stamp — when the GPU falls behind
+    # (turns: 11-12 ms per 10 ms step) the sim slows down instead of
+    # publishing stale poses.  The bringup derives use_sim_time:=true for
+    # all nodes from this key (explicit use_sim_time:= on the CLI wins).
+    # Details: Doku/SETUP_TROUBLESHOOTING_LOG.md, B9/B10.
+    sim_time_stamps: true
+
     # Render rate.  Drives:
     #  * newton GL ViewerGL frame cadence
     #  * ovrtx visualizer's per-frame target FPS (latest-state-wins —

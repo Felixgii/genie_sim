@@ -55,6 +55,13 @@ struct NodeOptions
 
   bool fake_slam = false;
 
+  // Opt-in (launcher param ``sim_time_stamps``): every header stamp is the
+  // sim_time of the physics step the data comes from, and /clock, /tf,
+  // /odom, /joint_states publish directly (no try_lock drops) so /clock is
+  // gap-free and published after the data of the same step.  Off = wall
+  // clock (node_->now()) + RealtimePublisher, exactly as before.
+  bool sim_time_stamps = false;
+
   int executor_threads = 2;
 };
 
@@ -207,12 +214,28 @@ private:
   using RTPubCamInfo = realtime_tools::RealtimePublisher<sensor_msgs::msg::CameraInfo>;
   using RTPubFloat32 = realtime_tools::RealtimePublisher<std_msgs::msg::Float32>;
 
+  // Only one of each pair exists: the RealtimePublisher (default) or the
+  // direct publisher (opts_.sim_time_stamps).
   std::shared_ptr<RTPubClock> pub_clock_;
   std::shared_ptr<RTPubJoint> pub_joint_;
   std::shared_ptr<RTPubOdom> pub_odom_;
   std::shared_ptr<RTPubTF> pub_tf_;
   std::shared_ptr<RTPubTF> pub_tf_render_;
   std::shared_ptr<RTPubFloat32> pub_rtf_;
+
+  rclcpp::Publisher<rosgraph_msgs::msg::Clock>::SharedPtr pub_clock_direct_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_joint_direct_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_direct_;
+  rclcpp::Publisher<tf2_msgs::msg::TFMessage>::SharedPtr pub_tf_direct_;
+  // Reused message buffers for the direct path (physics thread only).
+  rosgraph_msgs::msg::Clock clock_msg_;
+  sensor_msgs::msg::JointState joint_msg_;
+  nav_msgs::msg::Odometry odom_msg_;
+  tf2_msgs::msg::TFMessage tf_msg_;
+
+  // Header stamp for data of the step at ``sim_time``: sim time when
+  // opts_.sim_time_stamps, else wall clock.
+  builtin_interfaces::msg::Time stamp_for(double sim_time) const;
 
   // Camera publisher map. Built lazily by create_camera_publisher().
   // Reads (publish + has_image_subscribers) from the OVRtx render thread are

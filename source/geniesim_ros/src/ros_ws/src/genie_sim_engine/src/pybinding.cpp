@@ -57,7 +57,8 @@ static void init_ros(
   const std::string & ns,
   bool fake_slam,
   int executor_threads,
-  const std::string & base_frame)
+  const std::string & base_frame,
+  bool sim_time_stamps)
 {
   auto & c = core();
   std::lock_guard<std::mutex> lk(c.mu);
@@ -67,6 +68,7 @@ static void init_ros(
   opts.namespace_ = ns;
   opts.fake_slam = fake_slam;
   opts.executor_threads = executor_threads;
+  opts.sim_time_stamps = sim_time_stamps;
   if (!base_frame.empty()) {
     // Override the child_frame_id used by publish_odom (TF + nav_msgs).
     // Required when the URDF declares a base_footprint as the ground-
@@ -432,7 +434,7 @@ PYBIND11_MODULE(genie_sim_engine_py, m)
     "init_ros", &init_ros,
     py::arg("node_name"), py::arg("namespace") = std::string(""),
     py::arg("fake_slam") = false, py::arg("executor_threads") = 2,
-    py::arg("base_frame") = std::string(""));
+    py::arg("base_frame") = std::string(""), py::arg("sim_time_stamps") = false);
   m.def(
     "init_scheduler", &init_scheduler,
     py::arg("render_target_hz"), py::arg("render_safety_ms"),

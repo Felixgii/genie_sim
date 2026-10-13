@@ -184,12 +184,21 @@ class EngineSession:
         # only for hosts pinning the single-edge TF for compatibility tests;
         # not used in production.
         _base_frame = "base_footprint"
+        # sim_time_stamps needs the async-mirror / GPU-sync plumbing of the
+        # newton-standalone engine; the Kit engines keep wall-clock stamps.
+        sim_time_stamps = ep.sim_time_stamps and physics_engine == "newton"
+        if ep.sim_time_stamps and not sim_time_stamps:
+            logger.warn(
+                f"sim_time_stamps is only supported by newton-standalone, not {physics_engine!r} "
+                f"-- ignoring it, stamps stay wall clock"
+            )
         _core.init_ros(
             node_name=node_name,
             namespace="",
             fake_slam=ep.fake_slam,
             executor_threads=2,
             base_frame=_base_frame,
+            sim_time_stamps=sim_time_stamps,
         )
         _core.init_scheduler(
             render_target_hz=render_hz,
@@ -243,6 +252,13 @@ class EngineSession:
             mujoco_pd_kd=ep.mujoco_pd_kd,
         )
 
+        if sim_time_stamps:
+            sim.enable_sim_time_stamps()
+            logger.info(
+                "sim_time_stamps: ON -- all stamps = sim_time of the physics step, "
+                "/clock every step, GPU sync per step (consumers need use_sim_time:=true)"
+            )
+
         _, body_frames = snapshot_body_transforms(sim.stage, sim.body_paths)
         _core.set_topology(list(sim.joint_names), list(body_frames))
 
@@ -250,6 +266,7 @@ class EngineSession:
         self.physics_hz = ep.physics_hz
         self.render_hz = render_hz
         self.realtime_factor = ep.realtime_factor
+        self.sim_time_stamps = sim_time_stamps
         self.dt = 1.0 / ep.physics_hz
         self.scene_usda = scene_usda
 
@@ -265,6 +282,7 @@ class EngineSession:
             self.logger,
             post_step_hooks=self.post_step_hooks,
             rtf=self.realtime_factor,
+            sim_time_stamps=self.sim_time_stamps,
         ).spin(
             render_hook=render_hook,
             exit_check=exit_check,

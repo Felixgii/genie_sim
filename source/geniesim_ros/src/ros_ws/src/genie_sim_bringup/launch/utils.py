@@ -431,6 +431,44 @@ def common_declared_arguments() -> List[DeclareLaunchArgument]:
 # ---------------------------------------------------------------------------
 
 
+def launcher_sim_time_stamps(ros_params: dict) -> bool:
+    """True if a node section of the launcher YAML sets ``sim_time_stamps: true``.
+
+    ``ros_params`` is the second return value of :func:`load_launcher_yaml`.
+    """
+    for section in (ros_params or {}).values():
+        params = section.get("ros__parameters") if isinstance(section, dict) else None
+        if isinstance(params, dict) and str(params.get("sim_time_stamps", "")).strip().lower() in (
+            "true",
+            "1",
+            "yes",
+            "on",
+        ):
+            return True
+    return False
+
+
+def effective_use_sim_time(context, ros_params: dict, warn: bool = False) -> str:
+    """``use_sim_time`` ("true"/"false") for every node of the bringup.
+
+    An explicit ``use_sim_time:=…`` on the CLI wins.  Otherwise a launcher
+    whose engine stamps with sim time (``sim_time_stamps: true``, e.g. the
+    nav launcher) turns it on: with wall-clock consumers those stamps would
+    silently break every TF lookup.  ``warn`` prints the conflicting case
+    (sim stamps but ``use_sim_time:=false``) once.
+    """
+    stamps = launcher_sim_time_stamps(ros_params)
+    if _cli_explicit("use_sim_time"):
+        value = perform(context, "use_sim_time")
+        if warn and stamps and value != "true":
+            print(
+                f"{ERR_COLOR}use_sim_time:={value} but the launcher sets sim_time_stamps: true -- "
+                f"the engine stamps with sim time, wall-clock nodes will fail TF lookups{RESET}"
+            )
+        return value
+    return "true" if stamps else perform(context, "use_sim_time")
+
+
 def perform(context, key: str) -> str:
     """Shorthand for ``context.perform_substitution(LaunchConfiguration(key))``."""
     return context.perform_substitution(LaunchConfiguration(key))

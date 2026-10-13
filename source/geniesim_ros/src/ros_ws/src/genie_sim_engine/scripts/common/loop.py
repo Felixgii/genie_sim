@@ -76,10 +76,16 @@ def _parse_args(argv, prefix: str = "genie_sim_engine") -> dict:
     return out
 
 
-def _publish_tick(sim, sim_time: float, _core) -> float:
-    """Publish clock / joints / bodies / odom.  Returns total ms."""
+def _publish_tick(sim, sim_time: float, _core, clock_last: bool = False) -> float:
+    """Publish clock / joints / bodies / odom.  Returns total ms.
+
+    ``clock_last`` (sim_time_stamps): /clock goes out after the data of the
+    same step, so a consumer's ``now()`` never runs ahead of the newest TF
+    (no extrapolation-into-the-future errors at ``now()``).
+    """
     t0 = time.monotonic()
-    _core.publish_clock(sim_time)
+    if not clock_last:
+        _core.publish_clock(sim_time)
     t1 = time.monotonic()
 
     jpos, jvel = sim.get_joint_states()
@@ -95,6 +101,8 @@ def _publish_tick(sim, sim_time: float, _core) -> float:
     if base is not None:
         base_pose, base_twist = base
         _core.publish_odom(sim_time, base_pose, base_twist)
+    if clock_last:
+        _core.publish_clock(sim_time)
 
     publish_ms = (time.monotonic() - t0) * 1000.0
     sim.note_publish_phase(
@@ -166,10 +174,13 @@ class EngineRunLoop:
     * ``Budget``   — avg and worst-case ``(step+publish) / dt`` utilisation.
     """
 
-    def __init__(self, core, sim, dt: float, logger, post_step_hooks=None, rtf: float = 1.0):
+    def __init__(self, core, sim, dt: float, logger, post_step_hooks=None, rtf: float = 1.0, sim_time_stamps: bool = False):
         self._core = core
         self._sim = sim
         self._dt = dt
+        # sim_time_stamps: the engine's own step clock is the single time
+        # source (it also stamps the mirrors / scan); /clock goes out last.
+        self._sim_time_stamps = sim_time_stamps
         self._wall_tick = dt / max(rtf, 1e-6)
         self._logger = logger
         self._post_step_hooks = list(post_step_hooks) if post_step_hooks else []
@@ -281,8 +292,11 @@ class EngineRunLoop:
                     next_tick += wall_tick
                     continue
 
-                sim_time += dt
-                publish_ms = _publish_tick(sim, sim_time, core)
+                if self._sim_time_stamps:
+                    sim_time = sim.sim_time
+                else:
+                    sim_time += dt
+                publish_ms = _publish_tick(sim, sim_time, core, clock_last=self._sim_time_stamps)
 
                 # /rtf — instantaneous dt_sim / wall_delta for this physics
                 # step, published every step.

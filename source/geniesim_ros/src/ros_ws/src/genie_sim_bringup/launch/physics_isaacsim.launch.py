@@ -192,9 +192,13 @@ def generate_launch_description():
         launcher_config_arg = lu.perform(context, "launcher_config").strip()
         plugins_cfg_path = lu.resolve_bringup_config_file(launcher_config_arg) if launcher_config_arg else ""
         launcher_section: dict = {}
+        _plug_yaml: dict = {}
         plugins_params_path = ""
         if plugins_cfg_path:
             launcher_section, _plug_yaml, plugins_params_path = lu.load_launcher_yaml(plugins_cfg_path)
+        # Same derivation as app.launch.py (sim_time_stamps → use_sim_time).
+        use_sim_time = lu.effective_use_sim_time(context, _plug_yaml)
+        common_param = {"use_sim_time": True if "true" == use_sim_time else False}
 
         # ---- pull own args -----------------------------------------------
         # ``physics_engine`` is a plain launch arg with the standard

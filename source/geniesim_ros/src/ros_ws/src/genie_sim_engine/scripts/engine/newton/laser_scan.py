@@ -48,7 +48,11 @@ Design notes:
   into the plane) is reported as no-return (+inf).
 * **Timing**: gated on wall clock and stamped with the rclpy node's
   wall clock, matching the C++ bridge (``node_->now()``).  The stamp is
-  taken when the cast is enqueued (= the state the rays see).
+  taken when the cast is enqueued (= the state the rays see).  With the
+  launcher's ``sim_time_stamps`` the engine passes the step's sim_time:
+  then the rate gate runs on sim time and the stamp is that sim_time, so
+  the scan carries the time of the state it saw, not of the later tick
+  that publishes it.
 * **Async readback** (no device sync in the physics loop): a due scan
   enqueues raycast + ``wp.copy`` into pinned host buffers + a
   ``wp.Event`` on the physics stream and returns.  Later ticks poll
@@ -74,6 +78,7 @@ from typing import Any, Optional
 
 import numpy as np
 import warp as wp
+from builtin_interfaces.msg import Time as TimeMsg
 
 _DEFAULTS = {
     "topic": "/scan",
@@ -344,14 +349,18 @@ class LaserScanSensor:
             f"{2.0 * self._height:.2f} m:\n" + "\n".join(lines)
         )
 
-    def maybe_publish(self, state: Any) -> None:
-        """Called every physics tick; never waits for the GPU (see module doc)."""
+    def maybe_publish(self, state: Any, sim_time: Optional[float] = None) -> None:
+        """Called every physics tick; never waits for the GPU (see module doc).
+
+        ``sim_time``: sim time of the step ``state`` belongs to when the
+        engine runs with ``sim_time_stamps``; ``None`` = wall clock.
+        """
         if self._pending_stamp is not None:
             self._pending_ticks += 1
             if not self._done.is_complete:
                 return
             self._publish_pending()
-        now = time.monotonic()
+        now = time.monotonic() if sim_time is None else sim_time
         if now < self._next_t:
             return
         # Fixed period; snap forward after long stalls instead of bursting.
@@ -362,7 +371,12 @@ class LaserScanSensor:
         wp.copy(self._depth_host, self._depth)
         wp.copy(self._shape_host, self._shape_idx)
         wp.record_event(self._done)
-        self._pending_stamp = self._node.get_clock().now().to_msg()
+        if sim_time is None:
+            self._pending_stamp = self._node.get_clock().now().to_msg()
+        else:
+            # Same nanosecond rounding as the C++ bridge's /clock.
+            ns = int(round(sim_time * 1e9))
+            self._pending_stamp = TimeMsg(sec=ns // 1_000_000_000, nanosec=ns % 1_000_000_000)
         self._pending_ticks = 0
 
     def _publish_pending(self) -> None:

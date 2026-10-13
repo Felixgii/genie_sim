@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <utility>
 
@@ -27,7 +28,28 @@ inline builtin_interfaces::msg::Time stamp_from_seconds(double t)
   return s;
 }
 
+// Rounded to the nearest nanosecond (stamp_from_seconds truncates, so e.g.
+// 0.03 s becomes 0.029999999).  Used for sim_time_stamps, where /clock and
+// every data stamp of a step must be bit-identical and on the dt grid.
+inline builtin_interfaces::msg::Time stamp_from_seconds_rounded(double t)
+{
+  builtin_interfaces::msg::Time s;
+  if (t < 0.0) {t = 0.0;}
+  const std::int64_t ns = std::llround(t * 1e9);
+  s.sec = static_cast<int32_t>(ns / 1000000000LL);
+  s.nanosec = static_cast<uint32_t>(ns % 1000000000LL);
+  return s;
+}
+
 }  // namespace
+
+builtin_interfaces::msg::Time RosBridge::stamp_for(double sim_time) const
+{
+  if (opts_.sim_time_stamps) {
+    return stamp_from_seconds_rounded(sim_time);
+  }
+  return node_->now();
+}
 
 RosBridge::RosBridge(int argc, char ** argv, const NodeOptions & opts)
 : opts_(opts)
@@ -54,15 +76,28 @@ RosBridge::RosBridge(int argc, char ** argv, const NodeOptions & opts)
   // only shows /tf_static frames" even though `ros2 topic echo /tf` works.
   const rclcpp::QoS qos_tf = rclcpp::QoS(rclcpp::KeepLast(100));
 
-  pub_clock_ = std::make_shared<RTPubClock>(
-    node_->create_publisher<rosgraph_msgs::msg::Clock>(opts_.topic_clock, qos_clock));
-  pub_joint_ = std::make_shared<RTPubJoint>(
-    node_->create_publisher<sensor_msgs::msg::JointState>(
-      opts_.topic_joint_states, qos_joint_states));
-  pub_odom_ = std::make_shared<RTPubOdom>(
-    node_->create_publisher<nav_msgs::msg::Odometry>(opts_.topic_odom, qos_default));
-  pub_tf_ = std::make_shared<RTPubTF>(
-    node_->create_publisher<tf2_msgs::msg::TFMessage>(opts_.topic_tf, qos_tf));
+  if (opts_.sim_time_stamps) {
+    // Direct publish from the physics thread: no try_lock drops, so /clock
+    // advances every step and /tf never misses a step (B9: ~28 Hz map->odom
+    // arrived through the RealtimePublisher under GPU sync).
+    pub_clock_direct_ =
+      node_->create_publisher<rosgraph_msgs::msg::Clock>(opts_.topic_clock, qos_clock);
+    pub_joint_direct_ = node_->create_publisher<sensor_msgs::msg::JointState>(
+      opts_.topic_joint_states, qos_joint_states);
+    pub_odom_direct_ =
+      node_->create_publisher<nav_msgs::msg::Odometry>(opts_.topic_odom, qos_default);
+    pub_tf_direct_ = node_->create_publisher<tf2_msgs::msg::TFMessage>(opts_.topic_tf, qos_tf);
+  } else {
+    pub_clock_ = std::make_shared<RTPubClock>(
+      node_->create_publisher<rosgraph_msgs::msg::Clock>(opts_.topic_clock, qos_clock));
+    pub_joint_ = std::make_shared<RTPubJoint>(
+      node_->create_publisher<sensor_msgs::msg::JointState>(
+        opts_.topic_joint_states, qos_joint_states));
+    pub_odom_ = std::make_shared<RTPubOdom>(
+      node_->create_publisher<nav_msgs::msg::Odometry>(opts_.topic_odom, qos_default));
+    pub_tf_ = std::make_shared<RTPubTF>(
+      node_->create_publisher<tf2_msgs::msg::TFMessage>(opts_.topic_tf, qos_tf));
+  }
   pub_tf_render_ = std::make_shared<RTPubTF>(
     node_->create_publisher<tf2_msgs::msg::TFMessage>(opts_.topic_tf_render, qos_tf));
   pub_rtf_ = std::make_shared<RTPubFloat32>(
@@ -171,6 +206,12 @@ void RosBridge::publish_clock(double sim_time)
   // draining the previous message we drop this tick — /clock is a
   // periodic stream and the next tick recovers.
   last_sim_time_.store(sim_time, std::memory_order_relaxed);
+  if (opts_.sim_time_stamps) {
+    // Every step, same rounding as the data stamps of this step.
+    clock_msg_.clock = stamp_from_seconds_rounded(sim_time);
+    pub_clock_direct_->publish(clock_msg_);
+    return;
+  }
   if (pub_clock_->trylock()) {
     pub_clock_->msg_.clock = stamp_from_seconds(sim_time);
     pub_clock_->unlockAndPublish();
@@ -188,31 +229,36 @@ void RosBridge::publish_rtf(float rtf)
 void RosBridge::publish_joint_states(
   double sim_time, const double * joint_pos, const double * joint_vel, std::size_t n)
 {
-  (void)sim_time;
   if (n != joint_names_.size()) {return;}
-  if (!pub_joint_->trylock()) {return;}
-  auto & msg = pub_joint_->msg_;
-  msg.header.stamp = node_->now();
-  msg.name = joint_names_;
-  msg.position.resize(n);
-  msg.velocity.resize(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    msg.position[i] = joint_pos ? joint_pos[i] : 0.0;
-    msg.velocity[i] = joint_vel ? joint_vel[i] : 0.0;
+  auto fill = [&](sensor_msgs::msg::JointState & msg) {
+      msg.header.stamp = stamp_for(sim_time);
+      msg.name = joint_names_;
+      msg.position.resize(n);
+      msg.velocity.resize(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        msg.position[i] = joint_pos ? joint_pos[i] : 0.0;
+        msg.velocity[i] = joint_vel ? joint_vel[i] : 0.0;
+      }
+    };
+  if (opts_.sim_time_stamps) {
+    fill(joint_msg_);
+    pub_joint_direct_->publish(joint_msg_);
+    return;
   }
+  if (!pub_joint_->trylock()) {return;}
+  fill(pub_joint_->msg_);
   pub_joint_->unlockAndPublish();
 }
 
 void RosBridge::publish_body_tf_render(
   double sim_time, const double * body_xyzwxyz, std::size_t n_bodies)
 {
-  (void)sim_time;
   if (n_bodies != body_frames_.size()) {return;}
   if (!pub_tf_render_->trylock()) {return;}
   auto & tfs = pub_tf_render_->msg_;
   tfs.transforms.clear();
   tfs.transforms.reserve(n_bodies);
-  auto stamp = node_->now();
+  const auto stamp = stamp_for(sim_time);
   for (std::size_t i = 0; i < n_bodies; ++i) {
     geometry_msgs::msg::TransformStamped t;
     t.header.stamp = stamp;
@@ -235,9 +281,8 @@ void RosBridge::publish_odom(
   double sim_time, const double * base_xyzwxyz,
   const double * base_twist)
 {
-  (void)sim_time;
   if (!base_xyzwxyz) {return;}
-  auto stamp = node_->now();
+  const auto stamp = stamp_for(sim_time);
 
   // ``base_xyzwxyz`` carries base_link's full world pose (px,py,pz,qw,qx,qy,qz).
   // When ``opts_.base_frame`` is "base_footprint" (mobile-base scenes), we
@@ -294,8 +339,7 @@ void RosBridge::publish_odom(
     res_qz = a * qz + b * qy - c * qx + d * qw;
   }
 
-  if (pub_odom_->trylock()) {
-    auto & odom = pub_odom_->msg_;
+  auto fill_odom = [&](nav_msgs::msg::Odometry & odom) {
     odom.header.stamp = stamp;
     odom.header.frame_id = opts_.odom_frame;
     odom.child_frame_id = opts_.base_frame;
@@ -321,11 +365,9 @@ void RosBridge::publish_odom(
       odom.twist.twist.angular.y = 0.0;
       odom.twist.twist.angular.z = 0.0;
     }
-    pub_odom_->unlockAndPublish();
-  }
+    };
 
-  if (pub_tf_->trylock()) {
-    auto & tfs = pub_tf_->msg_;
+  auto fill_tf = [&](tf2_msgs::msg::TFMessage & tfs) {
     tfs.transforms.clear();
 
     // odom -> base_frame (ground-projected when split, else base_link verbatim).
@@ -366,6 +408,21 @@ void RosBridge::publish_odom(
       m.transform.rotation.w = 1.0;
       tfs.transforms.push_back(std::move(m));
     }
+    };
+
+  if (opts_.sim_time_stamps) {
+    fill_odom(odom_msg_);
+    pub_odom_direct_->publish(odom_msg_);
+    fill_tf(tf_msg_);
+    pub_tf_direct_->publish(tf_msg_);
+    return;
+  }
+  if (pub_odom_->trylock()) {
+    fill_odom(pub_odom_->msg_);
+    pub_odom_->unlockAndPublish();
+  }
+  if (pub_tf_->trylock()) {
+    fill_tf(pub_tf_->msg_);
     pub_tf_->unlockAndPublish();
   }
 }
@@ -456,7 +513,6 @@ void RosBridge::publish_camera_image_rgba8(
   std::uint32_t width,
   const std::uint8_t * data)
 {
-  (void)sim_time;
   image_transport::Publisher pub;
   {
     std::lock_guard<std::mutex> lk(cam_pubs_mu_);
@@ -472,15 +528,13 @@ void RosBridge::publish_camera_image_rgba8(
   // on.  We allocate a unique_ptr so the message is moved into the
   // pub-side queue rather than copied per transport.
   //
-  // Stamp is wall-clock (``node_->now()``), NOT ``sim_time``: RViz keeps
-  // its TF buffer in wall time (use_sim_time=false project-wide), and
-  // RViz's Camera display rejects images whose stamp can't be looked up
-  // against the TF buffer.  ``/clock`` is published only as a debug
-  // signal and intentionally not consumed by anything else.  joint_states
-  // / body_tf / odom already follow this convention (see existing
-  // ``(void)sim_time`` casts at lines 169, 187, 216).
+  // Stamp via stamp_for(): wall clock by default (RViz keeps its TF buffer
+  // in wall time when use_sim_time=false, and the Camera display rejects
+  // images whose stamp can't be looked up in TF), sim_time when
+  // opts_.sim_time_stamps — same convention as joint_states / tf / odom.
+  // ``sim_time`` is the caller's last_sim_time(), the latest published step.
   auto msg = std::make_unique<sensor_msgs::msg::Image>();
-  msg->header.stamp = node_->now();
+  msg->header.stamp = stamp_for(sim_time);
   msg->header.frame_id = frame_id;
   msg->height = height;
   msg->width = width;
@@ -501,7 +555,6 @@ void RosBridge::publish_camera_image_depth32f(
   std::uint32_t width,
   const float * data)
 {
-  (void)sim_time;
   image_transport::Publisher pub;
   {
     std::lock_guard<std::mutex> lk(cam_pubs_mu_);
@@ -511,9 +564,9 @@ void RosBridge::publish_camera_image_depth32f(
   }
   if (!data) {return;}
 
-  // Wall-clock stamp; see publish_camera_image_rgba8 for the rationale.
+  // Stamp convention: see publish_camera_image_rgba8.
   auto msg = std::make_unique<sensor_msgs::msg::Image>();
-  msg->header.stamp = node_->now();
+  msg->header.stamp = stamp_for(sim_time);
   msg->header.frame_id = frame_id;
   msg->height = height;
   msg->width = width;
@@ -538,7 +591,6 @@ void RosBridge::publish_camera_info(
   const std::vector<double> & D,
   const std::string & distortion_model)
 {
-  (void)sim_time;
   std::shared_ptr<RTPubCamInfo> pub;
   {
     std::lock_guard<std::mutex> lk(cam_pubs_mu_);
@@ -548,10 +600,9 @@ void RosBridge::publish_camera_info(
   if (!pub->trylock()) {return;}
 
   auto & msg = pub->msg_;
-  // Wall-clock stamp; must match the paired image so RViz's Camera
-  // display can sync them and look the camera frame up in TF (also
-  // wall-clock).  See publish_camera_image_rgba8 for full rationale.
-  msg.header.stamp = node_->now();
+  // Same clock as the paired image so RViz's Camera display can sync them
+  // and look the camera frame up in TF.  See publish_camera_image_rgba8.
+  msg.header.stamp = stamp_for(sim_time);
   msg.header.frame_id = frame_id;
   msg.height = height;
   msg.width = width;
