@@ -45,8 +45,9 @@ Die Visualisierung lief zunächst mit nur 1–3 Bildern pro Sekunde, weil Mesa d
 mangels GPU-Bibliotheken im Container per Software-Rasterizer (`llvmpipe`) renderte. Nach dem
 Einbinden der WSL-GPU-Bibliotheken rendert OpenGL über Mesas `d3d12`-Treiber auf der GPU. Die
 Simulationsschleife erreicht damit etwa 17 Hz bei einem Sollwert von 100 Hz, also rund 17 %
-Echtzeit. Der Physik-Schritt benötigt dabei nur etwa 0,7 ms, das Rendern rund 54 ms; das
-Rendern ist damit der begrenzende Faktor.
+Echtzeit. Der Physik-Schritt benötigt dabei auf der CPU nur etwa 0,7 ms, das Rendern rund
+54 ms; das Rendern ist damit der begrenzende Faktor. (Die 0,7 ms sind nur das Absetzen des
+Schritts an die GPU; auf der GPU selbst dauert er rund 15 ms, siehe B8.)
 
 Damit sich der Roboter fortbewegen kann, wurde in der Szene `pin_base_to_world` deaktiviert.
 Die Basis ist dadurch nicht mehr an der Welt fixiert, sondern unterliegt Schwerkraft und
@@ -349,6 +350,141 @@ Build: `geniesim ros build dev` im Container (C++, Symlink-Install allein reicht
 - Testumgebung: Nach mehreren Läufen stand der Roboter bei x≈0,22 m an einem Hindernis
   (Vorderräder blockiert). Die Tests oben laufen deshalb jeweils ab einem frischen Sim-Start.
 
+### B8 — Headless: periodisches Ruckeln, RTF < 1 (Konfig + Code-Fix, 2026-10-13)
+
+**Symptom:** `headless:=true`, Sollwert 100 Hz Wanduhr. `ros2 topic echo /rtf` zeigte
+meist 1,00, aber regelmäßig Einbrüche auf 0,06–0,13, danach Aufhol-Spitzen von 2,5–7,5.
+Für Nav2 (MPPI) und den späteren Learned Planner, die in Wanduhrzeit laufen
+(`use_sim_time=false`), ist ein gleichmäßiger RTF ≈ 1 nötig, nicht nur im Mittel.
+
+**Messmethode:** [Doku/tools/](tools/) (siehe unten). `/rtf` wird pro Physik-Schritt
+publiziert (Reliable), Wert = `dt / Wanduhr-Abstand`. Ein Subscriber mit großer Queue erhält
+damit jedes Schritt-Intervall einzeln, gemessen im Engine-Prozess. Die Engine bekommt dadurch
+keinen Zusatzaufwand. Mittlerer RTF = Δ`/clock` / Δ Wanduhr. Kontrolle auf Lücken: Anzahl
+`/rtf`-Nachrichten = erwartete Schritte (in allen Läufen exakt erfüllt). Die Phasen
+(Step/Solver/Extras/Publish) stammen aus den 1-Hz-Statistikblöcken im Engine-Log. Roboter im
+Stillstand, Original-Szene ohne Hindernisse auf Scan-Höhe, jeder Lauf ab frischem Sim-Start.
+
+**Befund 1 — zwei Engines gleichzeitig:** Zum Zeitpunkt der Beobachtung liefen im Container
+eine GUI-Instanz und eine Headless-Instanz parallel. Beide heißen
+`genie_sim_engine_newton`, publizieren auf dieselben Topics (`/rtf`, `/clock`, `/odom`, …),
+abonnieren `/cmd_4ws` und teilen sich die GPU (98 % Auslast). Die Headless-Physik kam so nur auf
+~45 Hz, `Extras` max 135–165 ms. Das Echo auf `/rtf` mischt zwei Quellen. Siehe Regel unten.
+
+**Befund 2 — die Ursache ist das GPU-Budget, nicht der Scan:**
+
+| Lauf (Default-Launcher, Substep 10, 70 s) | mittl. RTF | Schritte > 15 ms | p99 | max | Muster |
+|---|---|---|---|---|---|
+| Scan an | 0,633 | 15,8 % (fast alle 40–55 ms) | 53,8 ms | 67 ms | Hänger alle 6–7 Schritte (Median 97 ms), 100 % innerhalb 20 ms um einen Scan |
+| Scan aus (`enabled: false`) | 0,641 | 74,9 % (gleichmäßig ~15,5 ms) | 21,4 ms | 25 ms | keine Hänger |
+| Scan aus, `GENIESIM_STEP_GPU_SYNC=1` | 0,599 | – | – | – | **GPU-Zeit pro Schritt 14,9–15,1 ms** (max 17–19 ms) |
+
+Ein Physik-Schritt (MuJoCo-Warp, 10 Substeps à 1 ms) braucht auf der RTX 2080 Ti unter WSL2
+rund 15 ms GPU-Zeit. 100 Hz Echtzeit sind damit nicht erreichbar, mit oder ohne Scan.
+`sim.step()` startet nur den CUDA-Graph (CPU-Anteil ~0,6 ms) und wartet nicht. Die GPU-Arbeit
+staut sich deshalb auf:
+- **Scan an:** Das `numpy()`-Zurücklesen des Scans (alle ~100 ms) wartet den gesamten Rückstau
+  ab. Ergebnis: ein Hänger von 40–55 ms, danach kurze Aufhol-Schritte. Das ist das beobachtete
+  Muster.
+- **Scan aus:** Der Rückstau bremst jeden Schritt gleichmäßig auf ~15,5 ms (`Solver` 13,7 ms).
+  Es gibt keine Hänger, aber der mittlere RTF ist praktisch gleich (0,64).
+
+Nebenwirkung: `async_mirror.py` (Quelle für `/joint_states` und `/odom`) setzt voraus, dass die
+GPU innerhalb eines Ticks fertig ist („wall-time separation“). Bei Rückstau ist das nicht
+gegeben, die publizierten Zustände können dann älter sein als ihr Zeitstempel.
+
+**Fix 1 — eigene Launcher-Config mit 5 Substeps:**
+[launcher_newton_mjwarp_nav.yaml](../source/geniesim_ros/src/ros_ws/src/genie_sim_bringup/config/launcher_newton_mjwarp_nav.yaml),
+identisch zum Default bis auf `physics_solver_substep: 5` (sim_dt = 2 ms). Der Default-Launcher
+für Manipulationsszenen bleibt unverändert. **Kompromiss:** Laut Kommentar im Launcher hat das
+Schultergelenk des Arms bei 2 ms nur 1,3-fache Stabilitätsreserve (kp/M_eff), bei schnellen
+Armbewegungen ist Nachschwingen möglich. Für Navigation mit ruhenden Armen ist das unkritisch.
+Die Launcher-YAML greift, weil Launch-Argumente sie nur überschreiben, wenn sie explizit
+gesetzt sind (`lu._cli_explicit`).
+
+**Fix 2 — asynchroner Scan-Readback**
+([laser_scan.py](../source/geniesim_ros/src/ros_ws/src/genie_sim_engine/scripts/engine/newton/laser_scan.py)):
+Ein fälliger Scan startet Raycast, `wp.copy` in Pinned-Host-Puffer und `wp.record_event` und
+kehrt sofort zurück. Die folgenden Ticks fragen nicht blockierend `Event.is_complete` ab und
+publizieren, sobald das Event erreicht ist. Solange ein Scan aussteht, wird kein neuer gestartet,
+die Host-Puffer werden also nie während des Lesens beschrieben. Zeitstempel = Zeitpunkt des
+Starts (der Zustand, den die Strahlen sehen). Anders als `async_mirror.py` verlässt sich das nicht
+auf Wanduhr-Abstand: Ist die GPU im Rückstand, kommt der Scan später, statt die Schleife
+anzuhalten. Die Kalibrierung beim ersten Scan bleibt synchron (einmalig). Die Latenz wird etwa
+minütlich geloggt (`laser_scan: async readback latency …`).
+
+**Ergebnis (Nav-Launcher, je 300 s):**
+
+| | Default, Scan sync (70 s) | Nav, Scan sync | **Nav, Scan async** |
+|---|---|---|---|
+| mittlerer RTF | 0,633 | 0,999 | **0,996** |
+| Schritte > 15 ms | 15,8 % | 0,043 % | **0,017 %** |
+| p99 Schrittintervall | 53,8 ms | 12,2 ms | **10,1 ms** |
+| längster Schritt | 67 ms | 379 ms | 766 ms |
+| Hänger > 100 ms | 0 | 1 | 3 (innerhalb von 2 s) |
+| `/scan`-Rate | 10,0 Hz | 9,99 Hz | 9,92 Hz |
+| `Extras` (Scan-Tick) | mean 7–8, max 55 ms | – | mean 0,08, max 0,6 ms |
+| Scan-Latenz | – | – | mean 1,1, max 2 Ticks (einmal 36 im Hänger-Fenster) |
+
+**Offen — seltene große Hänger (0,2–0,8 s):** Sie treten mit beiden Varianten auf, etwa 1–3 in
+5 min, ohne festen Takt. Mit synchronem Scan liegen sie im Scan-Tick (`Extras`), mit asynchronem
+in `sim.step` (`Solver` max 764 ms). Sie sitzen also an der jeweils nächsten Stelle, die auf die
+GPU wartet. Vermutlich pausiert die mit Windows geteilte WSL-GPU als Ganzes (nicht belegt, nicht
+weiter untersucht). Der Loop holt danach nicht auf, sondern setzt den Takt neu
+(`loop fell behind … clamped`).
+
+**Fahrtest** ([drive_check.py](tools/drive_check.py), Servo + `/cmd_twist`, Hin- und Rückfahrt,
+stationäre Geschwindigkeit in Sim-Zeit über die letzten 30 % des Segments):
+
+| Segment | Substep 10 (RTF ~0,6) | Substep 5 (RTF ~1) |
+|---|---|---|
+| vor / zurück `x=±0.1` | +0,100 / −0,100 m/s | +0,100 / −0,100 m/s |
+| drehen `z=±0.5` | −0,462 rad/s (bei +0,5 nach 1,9 s Sim noch beim Umlenken) | +0,458 / −0,456 rad/s |
+| seitwärts `y=±0.1` | +0,100 / −0,100 m/s | +0,100 / −0,099 m/s |
+| Querdrift; Gierdrift bei Geradeausfahrt | ≤ 2 mm; ≤ 0,2° | ≤ 2 mm; ≤ 0,2° |
+| Nachlauf nach Stopp (Twist-Timeout 1 s) | 0,09 m | 0,11 m |
+
+Das Verhalten ist gleich. Unterschiede in den Strecken kommen vom RTF: Die Lenkung wird nach
+Wanduhr nachgeführt, bei RTF 0,6 vergeht pro Wanduhr-Sekunde weniger Sim-Zeit. Die erreichte
+Drehrate (~0,46 statt 0,5 rad/s) ist bei beiden Substep-Zahlen gleich.
+
+**Scan-Kurzprüfung** ([scan_check.py](tools/scan_check.py), Nav-Launcher + asynchroner Scan,
+B6-Testwände temporär über `newton.entries`, danach entfernt samt Scene-Cache):
+
+| Test | Ergebnis |
+|---|---|
+| Rate / Frame | 9,98 Hz, `base_scan`, 360 Strahlen, `range_max` 10 m; TF `base_footprint → base_scan` = (0, 0, 0,300) |
+| Stand bei x = −0,200 | r(0°) = 1,950 (soll 1,950), r(+90°) = 1,450 (soll 1,450), Abweichung 0,0 mm |
+| Fahrt auf die Wand zu (0,1 m/s) | +7 … +10 mm (Scan bis ~100 ms + 1 Tick älter als die Odometrie, bei 0,1 m/s also ≤ 10 mm); im Stand wieder 0,0 mm |
+| Original-Szene ohne Wände | alle Strahlen +inf (wie B6) |
+
+Einmalig fuhr der Roboter beim ersten Vorwärtsbefehl nach dem Start nicht los (rückwärts
+normal). Das ließ sich nicht reproduzieren, weder mit 20 Hz noch mit 100 Hz Twist-Rate (je
+±0,299 m). Ungeklärt.
+
+**Regel: nie zwei Engines gleichzeitig.** Vor jedem Start und jeder Messung prüfen:
+```bash
+pgrep -af genie_sim_engine_newton.py          # höchstens eine Zeile
+ros2 topic info /rtf | grep "Publisher count"  # muss 1 sein
+```
+Eine zweite Instanz mit Ctrl+C im eigenen Terminal beenden oder
+`Doku/tools/rtf_sim.sh stop` (beendet **alle** `app.launch`-Instanzen). `rtf_measure.py`
+warnt, wenn `/rtf` mehr als einen Publisher hat.
+
+**Messwerkzeuge** ([Doku/tools/](tools/), im Container unter `/workspace/Doku/tools/`, als
+Login-Shell `docker exec -u isaac-sim geniesim3 bash -lc '…'`):
+```bash
+T=/workspace/Doku/tools
+bash -l $T/rtf_sim.sh stop
+LAUNCHER=launcher_newton_mjwarp_nav bash -l $T/rtf_sim.sh start nav   # wartet bis die Physik läuft
+python3 $T/rtf_measure.py 300 nav 10   # 300 s nach 10 s Aufwärmen → /tmp/rtfbench/res_nav.json, raw_nav.csv
+python3 $T/drive_check.py              # Fahrtest (Servo muss laufen)
+python3 $T/scan_check.py               # nur mit B6-Testwänden sinnvoll
+```
+`rtf_sim.sh` beantwortet den ENTER-Prompt des experimentellen Launchers selbst. `EXTRA="…"`
+hängt weitere Launch-Argumente an. Phasen-Aufschlüsselung:
+`grep -E "Interval:|Solver:|Extras:" /tmp/rtfbench/launch_<tag>.log`.
+
 ---
 
 ## Anhang: Betrieb
@@ -362,6 +498,9 @@ ros2 launch genie_sim_bringup app.launch.py scene:=scene_pnp_g2_op \
   launcher_config:=launcher_newton_mjwarp headless:=false physics_engine_visualizer:=newton
 # einmal ENTER (Hinweis auf experimentellen Launcher)
 ```
+Für Navigation headless in Echtzeit (B8): `launcher_config:=launcher_newton_mjwarp_nav headless:=true`.
+Vorher prüfen, dass keine zweite Engine läuft (`pgrep -af genie_sim_engine_newton.py`).
+
 Fahren, im zweiten Terminal: `python3 /workspace/Doku/drive_base.py`
 (`w` vor, `s` zurück, Leertaste stopp, `+`/`-` Tempo, `q` beenden).
 
@@ -378,6 +517,8 @@ Beim ersten Start kompiliert Warp die CUDA-Kernel (mehrere Minuten, danach gecac
 | Python-Änderung ohne Wirkung? | – | Skripte sind per Symlink installiert, kein Rebuild nötig. Neue Dateien brauchen einen Symlink in `devel/` bzw. `geniesim ros build dev` |
 | Topics sichtbar, aber keine Daten (`ros2 topic echo` stumm, `tf2_echo`: frame does not exist) | `docker exec … bash -c` ist keine Login-Shell, DDS-Umgebung aus `/etc/profile.d/geniesim.sh` fehlt (B6) | `docker exec -u isaac-sim geniesim3 bash -lc '…'` oder `geniesim docker into` |
 | Entfernte `newton.entries` wirken weiter | Veraltete `newton_scene.usda`/`newton_solvers.json` im Scene-Cache (B6) | Dateien in `/geniesim_assets/scenes/<scene>/` löschen |
+| `/rtf` springt wild, Physik deutlich unter Soll | zweite Engine läuft parallel (z.B. GUI-Instanz in anderem Terminal), gleiche Topics, geteilte GPU (B8) | `pgrep -af genie_sim_engine_newton.py`, `ros2 topic info /rtf` → Publisher count 1; überzählige Instanz beenden |
+| Neue Config-Datei wird von `launcher_config:=` nicht gefunden | `devel/share/.../config` enthält Einzel-Symlinks | Symlink anlegen (`ln -s` auf die Datei in `source/`) oder `geniesim ros build dev` |
 | Änderungen auf D: kommen im Container nicht an | Container mountet die WSL-Kopie `~/genie_sim`, nicht das Git-Repo auf D: | Dateien kopieren und **nach LF konvertieren** (D: hat CRLF durch `autocrlf`) |
 
 ### Geänderte Dateien
@@ -395,6 +536,9 @@ Beim ersten Start kompiliert Warp die CUDA-Kernel (mehrere Minuten, danach gecac
 | `source/geniesim_ros/.../genie_sim_engine/AGENTS.md` | Datei-Layout um `laser_scan.py` ergänzt |
 | `Doku/scan_test_plugin.py` (neu) | Test-Plugin bewegtes Objekt (B6), nur temporär aktiv |
 | `source/geniesim_ros/.../genie_sim_controllers/src/servo_core.cpp` | `prev_cmd_.drive_speeds` bei Twist-Timeout auf 0 (B7) |
+| `source/geniesim_ros/.../genie_sim_bringup/config/launcher_newton_mjwarp_nav.yaml` (neu) | Nav-Launcher mit `physics_solver_substep: 5` (B8); in WSL zusätzlich Symlink in `devel/share/genie_sim_bringup/config/` |
+| `source/geniesim_ros/.../scripts/engine/newton/laser_scan.py` | asynchroner Scan-Readback (B8) |
+| `Doku/tools/` (neu) | Mess- und Prüfskripte `rtf_sim.sh`, `rtf_measure.py`, `drive_check.py`, `scan_check.py` (B8) |
 
 Backups in WSL: `~/genie_sim_crlf_backup_2026-10-11.tar.gz`, `~/assemble_robot.py.orig_2026-10-11`,
 `~/genie_sim_orig_2026-10-11/`, `~/genie_sim/scene_pnp_g2_op.yaml.bak_2026-10-11`,
