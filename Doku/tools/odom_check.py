@@ -368,6 +368,14 @@ print(f"/odom: Rate {len(o) / ((o[-1, 0] - o[0, 0]) / 1e9):.1f} Hz (Stempel), dt
       f"{np.percentile(dts, 50):.1f}/{np.percentile(dts, 99):.1f}/{dts.max():.1f} ms")
 print(f"/odom twist: max |vx| {np.abs(o[:, 5]).max():.3f}, max |vy| {np.abs(o[:, 6]).max():.3f} m/s, "
       f"max |wz| {np.abs(o[:, 7]).max():.4f} rad/s")
+# twist.angular.z vs yaw rate from consecutive poses (stamp dt).
+_dts = np.diff(o[:, 0]) / 1e9
+_ok = _dts > 1e-6
+_rate = np.arctan2(np.sin(np.diff(o[:, 4])), np.cos(np.diff(o[:, 4])))[_ok] / _dts[_ok]
+_err = np.abs(o[1:, 7][_ok] - _rate)
+print(f"/odom twist.angular.z vs Posen-Gierrate: |Fehler| p50 {np.percentile(_err, 50):.4f}, "
+      f"p99 {np.percentile(_err, 99):.4f}, max {_err.max():.4f} rad/s "
+      f"(wz bei Drehung p50 {np.percentile(np.abs(o[:, 7][np.abs(o[:, 7]) > 0.1]), 50) if np.any(np.abs(o[:, 7]) > 0.1) else 0:.3f})")
 # Stale samples: a /odom pose that steps back against the motion of its
 # neighbours (AsyncMirror slot read before its copy landed, see B9).
 P = o[:, 2:5]

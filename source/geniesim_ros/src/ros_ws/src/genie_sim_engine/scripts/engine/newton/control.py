@@ -54,8 +54,9 @@ class _ControlMixin:
                                       mode=VELOCITY).  Velocity target
                                       → ``control.joint_target_vel``.
 
-        ``cmd_4ws_stamp`` is the monotonic-now timestamp of the most
-        recent ``/cmd_4ws`` message.  When the elapsed since that stamp
+        ``cmd_4ws_stamp`` is the receive time of the most recent
+        ``/cmd_4ws`` message: monotonic-now, or sim time with
+        ``sim_time_stamps``.  When the elapsed since that stamp
         exceeds ``cmd_4ws_timeout_s``, the 4WS channel is treated as
         stale and every chassis_drive DOF is force-braked to vel=0 to
         keep the robot from running away if /cmd_4ws stops publishing.
@@ -76,7 +77,10 @@ class _ControlMixin:
         except Exception:  # noqa: BLE001
             timeout_s = 0.1
         if cmd_4ws_stamp:
-            elapsed = time.monotonic() - float(cmd_4ws_stamp)
+            # sim_time_stamps: the C++ bridge stamps the receipt with sim
+            # time, so the timeout counts sim time (see realtime_ros_node.cpp).
+            now = self._sim_time_acc if getattr(self, "_sim_time_stamps", False) else time.monotonic()
+            elapsed = now - float(cmd_4ws_stamp)
         else:
             elapsed = float("inf")
         cmd_4ws_stale = elapsed > timeout_s

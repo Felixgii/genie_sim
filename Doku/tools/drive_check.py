@@ -7,7 +7,12 @@ reports per segment, in the start-of-segment body frame:
   the last 30 % of the segment in SIM time (comparable across RTFs).
 Requires genie_sim_chassis_servo_node running.
 
-usage: drive_check.py [segment ...]   (default: all)
+Segment "b7" replays the B7 case: drive, then 3 s without /cmd_twist (servo
+twist timeout), then spin -- the spin must not creep forward (dx ~ 0).
+"fwd" drives backwards first: at the start pose the grippers are ~2 cm from
+the shelf front (B9).  Works with a servo on wall or sim time.
+
+usage: drive_check.py [segment ...]   (default: fwd spin side)
 """
 import math
 import sys
@@ -19,12 +24,16 @@ from nav_msgs.msg import Odometry
 from rclpy.qos import qos_profile_sensor_data
 from rosgraph_msgs.msg import Clock
 
-# name, (vx, vy, wz), drive seconds (wall)
+# name, (vx, vy, wz) or None (= publish nothing), drive seconds (wall)
 SEGMENTS = {
-    "fwd": [("vor  x=+0.1", (0.1, 0.0, 0.0), 3.0), ("zurueck x=-0.1", (-0.1, 0.0, 0.0), 3.0)],
+    "fwd": [("zurueck x=-0.1", (-0.1, 0.0, 0.0), 3.0), ("vor  x=+0.1", (0.1, 0.0, 0.0), 3.0)],
     "spin": [("drehen z=+0.5", (0.0, 0.0, 0.5), 4.0), ("drehen z=-0.5", (0.0, 0.0, -0.5), 4.0)],
     "side": [("seitw. y=+0.1", (0.0, 0.1, 0.0), 10.0), ("seitw. y=-0.1", (0.0, -0.1, 0.0), 10.0)],
+    "b7": [("B7 zurueck x=-0.2", (-0.2, 0.0, 0.0), 3.0), ("B7 Stille 3 s", None, 3.0),
+           ("B7 drehen z=+0.5", (0.0, 0.0, 0.5), 4.0), ("B7 Stille 3 s", None, 3.0),
+           ("B7 drehen z=-0.5", (0.0, 0.0, -0.5), 4.0)],
 }
+DEFAULT = ["fwd", "spin", "side"]
 PAUSE = 2.5  # > twist_timeout (1 s): servo stops sending, engine brakes
 
 rclpy.init()
@@ -65,11 +74,16 @@ def body_delta(a, b, yaw0):
 
 
 spin_for(1.0)
-names = sys.argv[1:] or list(SEGMENTS)
+names = sys.argv[1:] or DEFAULT
 print(f"{'Segment':16s} {'dx':>7s} {'dy':>7s} {'dyaw':>7s} {'t_sim':>6s} | steady: {'vx':>6s} {'vy':>6s} {'wz':>6s}")
 for n in names:
-    for label, (vx, vy, wz), dur in SEGMENTS[n]:
+    for label, twist_spec, dur in SEGMENTS[n]:
         i0 = len(odom)
+        if twist_spec is None:
+            spin_for(dur)
+            print(f"{label:16s} (kein /cmd_twist)")
+            continue
+        vx, vy, wz = twist_spec
         tw = Twist()
         tw.linear.x, tw.linear.y, tw.angular.z = vx, vy, wz
         spin_for(dur, tw)

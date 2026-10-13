@@ -4,6 +4,7 @@
 
 #include "realtime_ros_node.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -140,7 +141,17 @@ RosBridge::RosBridge(int argc, char ** argv, const NodeOptions & opts)
     [this](sensor_msgs::msg::JointState::ConstSharedPtr msg) {
       std::vector<double> pos(msg->position.begin(), msg->position.end());
       std::vector<double> vel(msg->velocity.begin(), msg->velocity.end());
-      cmd_store_.on_cmd_4ws(msg->name, pos, vel);
+      if (opts_.sim_time_stamps) {
+        // Receipt in sim time (latest published step) so the engine's
+        // cmd_4ws timeout counts sim time: a wall-clock stall of the sim
+        // (B8: up to ~0.8 s) must not look like a silent servo.  Floor at
+        // 1 ns because 0 means "never received".
+        cmd_store_.on_cmd_4ws(
+          msg->name, pos, vel,
+          std::max(last_sim_time_.load(std::memory_order_relaxed), 1e-9));
+      } else {
+        cmd_store_.on_cmd_4ws(msg->name, pos, vel);
+      }
     });
 
   rclcpp::ExecutorOptions exec_opts;

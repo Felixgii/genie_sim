@@ -40,8 +40,17 @@ void RealtimeCommandBuffer::on_cmd_4ws(
   const std::vector<double> & positions,
   const std::vector<double> & velocities)
 {
+  on_cmd_4ws(names, positions, velocities, monotonic_now());
+}
+
+void RealtimeCommandBuffer::on_cmd_4ws(
+  const std::vector<std::string> & names,
+  const std::vector<double> & positions,
+  const std::vector<double> & velocities,
+  double stamp_s)
+{
   std::lock_guard<std::mutex> lk(mu_);
-  cmd_4ws_stamp_ = monotonic_now();
+  cmd_4ws_stamp_ = stamp_s;
   std::size_t n = names.size();
   for (std::size_t i = 0; i < n; ++i) {
     const std::string & name = names[i];

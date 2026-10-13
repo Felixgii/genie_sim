@@ -18,7 +18,8 @@ namespace genie_sim_controllers
 /// (``ChassisServoController``); the only difference is the surrounding
 /// shell:
 ///
-///   * tick is driven by a ``rclcpp::WallTimer`` at ``control_rate`` Hz
+///   * tick is driven by a node-clock timer at ``control_rate`` Hz (sim
+///     time with ``use_sim_time:=true``, else wall clock)
 ///     (the controller plugin uses the controller_manager's
 ///     ``update()`` callback instead).
 ///   * subscriptions / publisher / parameters live on this Node

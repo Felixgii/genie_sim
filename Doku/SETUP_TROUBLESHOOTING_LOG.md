@@ -600,6 +600,126 @@ python3 $T/odom_check.py --dry   # nur 5 s Stand aufzeichnen
 ```
 Der Servo startet mit `app.launch.py` nur bei `teleop:=true` oder `navigation:=true`.
 
+### B10 — Sim-Zeit-Stempel für Nav2 / Learned Planner (Code-Änderung, opt-in, 2026-10-13)
+
+**Ziel:** Nav2 und der spätere Learned Planner sollen mit `use_sim_time: true` laufen. Dazu
+trägt jede Nachricht die Sim-Zeit des Physikschritts, aus dem sie stammt. Vorher stempelte
+die Engine alles mit der Wanduhr (`node_->now()`), und `/clock` war nur ein Debug-Signal. Das
+geht nur gut, solange die Physik exakt in Echtzeit läuft, laut B9 tut sie das beim Drehen
+nicht: Posen bis 0,37 s älter als ihr Stempel, Rücksprünge, Überschwingen.
+
+**Schalter:** `sim_time_stamps: true` im Engine-Block von
+[launcher_newton_mjwarp_nav.yaml](../source/geniesim_ros/src/ros_ws/src/genie_sim_bringup/config/launcher_newton_mjwarp_nav.yaml).
+Nur der Nav-Launcher setzt ihn. Ohne den Schalter (alle anderen Launcher, Agibot-Szenen,
+MoveIt, Teleop) laufen dieselben Codepfade wie vorher. Die Kit-Engines (`isaac_physx`,
+`isaac_newton`) ignorieren den Schalter mit Warnung.
+
+**Was der Schalter bewirkt:**
+| Bereich | Mit `sim_time_stamps` | Datei |
+|---|---|---|
+| Stempel `/odom`, `/tf` (odom→base_footprint→base_link, map→odom), `/joint_states`, `/tf_render`, Kamera | Sim-Zeit des Schritts, auf ns gerundet (`stamp_for()`), identisch zum `/clock`-Wert | `realtime_ros_node.cpp` |
+| `/clock` | jeder Schritt, nach den Daten desselben Schritts (`now()` eines Konsumenten ist nie neuer als der neueste TF) | `realtime_ros_node.cpp`, `loop.py` |
+| Publisher `/clock`, `/tf`, `/odom`, `/joint_states` | direkt statt RealtimePublisher: kein Verwerfen per `trylock` | `realtime_ros_node.cpp/.hpp` |
+| Zeitquelle | eine: `engine.sim_time` = Schrittzähler × dt (exaktes Raster) | `engine_base.py`, `loop.py` |
+| GPU | Sync nach jedem Schritt (wie `GENIESIM_STEP_GPU_SYNC=1`). Die Sim wird langsamer, statt veraltete Posen zu liefern. | `engine_base.py` |
+| Zustand lesen | `AsyncMirror.read_latest()`: Slot dieses Schritts (nach dem Sync sicher gelandet) statt des Vortick | `async_mirror.py`, `state.py` |
+| `/scan` | Takt (`rate_hz`) in Sim-Zeit, Stempel = Sim-Zeit des Schritts beim Enqueue. Der asynchrone Readback (B8) bleibt. | `laser_scan.py` |
+| `/odom`-Twist | planar in `base_footprint`, **`angular.z` gefüllt**, aus zwei aufeinanderfolgenden Schritten (ohne Schalter unverändert, `angular.z` = 0) | `state.py` |
+| `cmd_4ws`-Timeout (0,1 s) | Empfang mit Sim-Zeit gestempelt, Vergleich in Sim-Zeit. Ein Wanduhr-Hänger der Sim bremst nicht mehr. | `realtime_buffer.*`, `realtime_ros_node.cpp`, `control.py` |
+| `use_sim_time` aller Bringup-Nodes (RSP, RViz, Servo, Teleop, Nav) | automatisch `true`. Ein explizites `use_sim_time:=…` auf der CLI gewinnt, `:=false` erzeugt eine rote Warnung. | `utils.py` (`effective_use_sim_time`), `app.launch.py`, `physics_isaacsim.launch.py` |
+
+Unabhängig vom Schalter: Der Chassis-Servo
+([servo_node.cpp](../source/geniesim_ros/src/ros_ws/src/genie_sim_ros_control/genie_sim_controllers/src/servo_node.cpp))
+taktet jetzt über `create_timer` (Node-Uhr) statt `create_wall_timer`. Mit `use_sim_time` läuft
+der Regeltakt in Sim-Zeit, passend zum festen MPC-`dt`. Ohne läuft er mit der Systemuhr, also
+in derselben Rate wie vorher. Twist- und State-Timeouts nutzten schon `now()`. Der B7-Fix
+(`servo_core.cpp`) ist unverändert.
+
+**Zeitvergleiche — Entscheidung:** Sim-Zeit für alles, was Sim-Logik ist: `cmd_4ws`-Timeout,
+Scan-Takt, Servo-Takt und -Timeouts, Debug-Marker (waren schon Sim-Zeit). Wanduhr für alles,
+was den Rechner betrifft: RT-Pacing der Physikschleife (`loop.py`), `/rtf`, OVRtx-Render-Pacing,
+Statistik- und GPU-Sync-Logs, Base-Runaway-Tripwire, `assemble_robot.py`-Startup-Timeout.
+Statische TFs (`world→map`, `base_footprint→base_scan`) behalten ihren Stempel, weil tf2 ihn
+ignoriert.
+
+**Tests** (Nav-Launcher, frische Sim je Lauf, eine Engine; Werkzeuge in [Doku/tools/](tools/)):
+
+| Test | mit Schalter | ohne Schalter (Nav-Kopie mit `false`) | Default-Launcher |
+|---|---|---|---|
+| `use_sim_time` (abgeleitet) / GPU-Sync | true / an | false / aus | false / aus |
+| `/clock` ([stamp_check.py](tools/stamp_check.py), 20 s) | 100 Hz, monoton, 0 Lücken | 100 Hz | 70 Hz (RTF 0,7 wie B8) |
+| Stempel im 10-ms-Raster und = `/clock`-Wert (`/odom`, `/tf` Engine + RSP, `/joint_states`, `/tf_render`, `/scan`) | 100 % | 0 % (Wanduhr, 2–10 ms Empfangsalter) | 0 % (Wanduhr) |
+| `/scan`-Stempel vs. Zustand | Alter 0 = Schritt, den die Strahlen sahen | – | – |
+| tf2 mit `use_sim_time` (393 Lookups je Art): @Scan-Stempel / @latest / @`now()` / @`now()`+50 ms | 0 / 0 / 1 / 0 Fehler | – | – |
+| [odom_check.py](tools/odom_check.py): Rücksprünge xy/Gier | **0 / 0** | 105 / 39 | – |
+| Drehung „+90°“ endet bei | **89,3°** | 99,2° | – |
+| Pfadlänge 100 Hz / 10 Hz | **4,124 / 4,118 m** | 4,605 / 4,242 m | – |
+| TF / `/tf_render` vs. `/odom` (max) | 0,0 mm / 0,0 mm | 0,0 / 4,0 mm | – |
+| `map→odom` angekommen / `/odom`-dt max | 5464 von 5464 / 10,0 ms | 6481 / 23,8 ms | – |
+| `/odom` `angular.z` | Drehung p50 0,455 rad/s (B8: 0,458), = Gierrate der Posen | 0 | – |
+| Publish-Zeit pro Tick (Stand, mittel / p99) | 0,61 / 0,96 ms | 0,77 / 1,16 ms | – |
+
+Der einzelne Fehler bei `now()` ohne Wartezeit entsteht, wenn `/clock` vor dem `/tf` desselben
+Schritts beim Konsumenten ankommt (zwei Topics, keine garantierte Reihenfolge). Nav2 arbeitet
+mit Nachrichtenstempeln und `transform_tolerance`, also unkritisch.
+
+Servo mit `use_sim_time:=true` ([drive_check.py](tools/drive_check.py) `fwd spin side b7`):
+
+| Segment | Ergebnis (stationär, Sim-Zeit) |
+|---|---|
+| zurück / vor `x=∓0.1` | −0,101 / +0,101 m/s, Querdrift 0 |
+| drehen `z=±0.5` | +0,459 / −0,452 rad/s |
+| seitwärts `y=±0.1` | +0,100 / −0,100 m/s |
+| B7: rückwärts 0,2 → 3 s ohne Twist → drehen +0,5 / → 3 s → −0,5 | dx −0,000 / +0,002 m, d. h. reine Drehung (Fix aus B7 greift) |
+| Nachlauf nach Stopp (Twist-Timeout 1 s) | 0,11 m (wie B8) |
+
+In einem Segment („drehen z=−0,5“) vergingen in 4 s Wanduhr nur 1,89 s Sim-Zeit. Ursache
+waren zwei WSL-GPU-Hänger (B8 „Offen“), einzelne Schritte mit 634 und 1089 ms. Mit Sim-Zeit
+pausiert dann einfach alles, das ist das gewollte Verhalten.
+
+**RTF** ([rtf_measure.py](tools/rtf_measure.py)), Kosten des GPU-Syncs:
+
+| | ohne Sync (B8, Nav async) | mit Schalter |
+|---|---|---|
+| Stand, 300 s | 0,996 | **0,964** (alle 28 909 Schritte publiziert, p99-Intervall 14,4 ms, 6 Hänger > 100 ms) |
+| Fahrt (odom_check, 64 s) | (scheinbar ~1, Physik real ~0,8 beim Drehen, B9) | **0,916** |
+
+Beim Drehen braucht die GPU 11–12 ms pro Schritt. Die Sim läuft dort mit ~0,8 und holt nicht
+auf. Fußgänger erhöhen die Last weiter, die Sim wird dann langsamer, bleibt aber konsistent.
+
+**Was sich für Nutzer ändert:**
+- Nav-Launcher: Alle Nodes im Graph brauchen `use_sim_time:=true`. Die Bringup-Nodes bekommen
+  es automatisch. **Separat gestartete Nodes** (Servo per `ros2 run`, RViz, Nav2, eigene
+  Skripte) müssen es selbst setzen, sonst passen ihre TF-Lookups nicht.
+- Die Sim-Zeit beginnt bei jedem Start bei 0. Nach einem Sim-Neustart springt `/clock` zurück:
+  RViz, Nav2 und tf2-Nutzer neu starten (RSP erkennt den Rücksprung selbst).
+- Vor der ersten `/clock` steht die Zeit der Nodes auf 0. Timer laufen erst los, wenn die Engine
+  publiziert.
+- Wanduhr-basierte Messskripte (rtf_measure, drive_check, odom_check) funktionieren weiter. Sie
+  lesen `/clock` bzw. werten Stempel aus und laufen als normale Nodes.
+- Der Default-Launcher und alle anderen Launcher: keine Änderung (Wanduhr). Beobachtung, nicht
+  durch B10 verursacht: Dort kommt der asynchrone Scan (B8) wegen des GPU-Rückstands bei
+  Substep 10 nur mit ~3,7 Hz und ~280 ms Alter an.
+
+**Start:**
+```bash
+# Engine (headless), use_sim_time wird automatisch true
+ros2 launch genie_sim_bringup app.launch.py scene:=scene_pnp_g2_op \
+  launcher_config:=launcher_newton_mjwarp_nav headless:=true
+# Servo separat (oder navigation:=true / teleop:=true im Launch)
+ros2 run genie_sim_controllers genie_sim_chassis_servo_node --ros-args -r __node:=servo_node \
+  --params-file $(ros2 pkg prefix genie_sim_controllers)/share/genie_sim_controllers/config/genie_g2.yaml \
+  -p use_sim_time:=true
+# RViz: im Launch mit rviz:=true, oder separat
+ros2 run rviz2 rviz2 --ros-args -p use_sim_time:=true
+# Nav2 / Learned Planner: use_sim_time: true in allen Node-Parametern
+```
+Prüfung: `python3 /workspace/Doku/tools/stamp_check.py 20` zeigt Raster und `/clock`-Abgleich
+pro Topic.
+
+Build: `geniesim ros build dev` (C++ in `genie_sim_engine` und `genie_sim_controllers`).
+Backup der Originale in WSL: `~/genie_sim_pre_b10_2026-10-13.tar.gz`.
+
 ---
 
 ## Anhang: Betrieb
@@ -614,6 +734,8 @@ ros2 launch genie_sim_bringup app.launch.py scene:=scene_pnp_g2_op \
 # einmal ENTER (Hinweis auf experimentellen Launcher)
 ```
 Für Navigation headless in Echtzeit (B8): `launcher_config:=launcher_newton_mjwarp_nav headless:=true`.
+Dieser Launcher stempelt mit Sim-Zeit (B10): separat gestartete Nodes (Servo, RViz, Nav2)
+brauchen `use_sim_time:=true`.
 Vorher prüfen, dass keine zweite Engine läuft (`pgrep -af genie_sim_engine_newton.py`).
 
 Fahren, im zweiten Terminal: `python3 /workspace/Doku/drive_base.py`
@@ -654,7 +776,11 @@ Beim ersten Start kompiliert Warp die CUDA-Kernel (mehrere Minuten, danach gecac
 | `source/geniesim_ros/.../genie_sim_bringup/config/launcher_newton_mjwarp_nav.yaml` (neu) | Nav-Launcher mit `physics_solver_substep: 5` (B8); in WSL zusätzlich Symlink in `devel/share/genie_sim_bringup/config/` |
 | `source/geniesim_ros/.../scripts/engine/newton/laser_scan.py` | asynchroner Scan-Readback (B8) |
 | `Doku/tools/` (neu) | Mess- und Prüfskripte `rtf_sim.sh`, `rtf_measure.py`, `drive_check.py`, `scan_check.py` (B8) |
-| `Doku/tools/odom_check.py` (neu) | Odometrie- / Ground-Truth-Vergleich mit Testfahrt (B9) |
+| `Doku/tools/odom_check.py` (neu) | Odometrie- / Ground-Truth-Vergleich mit Testfahrt (B9); Vergleich `angular.z` (B10) |
+| `genie_sim_engine`: `realtime_ros_node.cpp/.hpp`, `pybinding.cpp`, `realtime_buffer.cpp/.hpp`, `scripts/common/{params,session,loop}.py`, `scripts/engine/newton/{engine_base,state,async_mirror,laser_scan,control}.py` | Sim-Zeit-Stempel opt-in (`sim_time_stamps`) (B10) |
+| `genie_sim_bringup`: `launch/{utils,app.launch,physics_isaacsim.launch}.py`, `config/launcher_newton_mjwarp_nav.yaml` | `use_sim_time` aus dem Launcher ableiten, Schalter im Nav-Launcher (B10) |
+| `genie_sim_controllers`: `servo_node.cpp/.hpp` | Regeltakt über Node-Uhr (`create_timer`) (B10) |
+| `Doku/tools/stamp_check.py` (neu), `Doku/tools/drive_check.py` | Stempel-/tf2-Prüfung; drive_check: Segment `b7`, `fwd` fährt zuerst rückwärts (B10) |
 
 Backups in WSL: `~/genie_sim_crlf_backup_2026-10-11.tar.gz`, `~/assemble_robot.py.orig_2026-10-11`,
 `~/genie_sim_orig_2026-10-11/`, `~/genie_sim/scene_pnp_g2_op.yaml.bak_2026-10-11`,

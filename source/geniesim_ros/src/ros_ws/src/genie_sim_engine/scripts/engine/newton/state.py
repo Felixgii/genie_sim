@@ -13,6 +13,7 @@ resolve through the engine's MRO.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import xml.etree.ElementTree as ET
@@ -21,6 +22,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import warp as wp
+
+
+def _yaw_of(q_wxyz: np.ndarray) -> float:
+    """Z-Y-X yaw of a (qw, qx, qy, qz) quaternion (same formula as the C++ odom split)."""
+    qw, qx, qy, qz = (float(v) for v in q_wxyz)
+    return math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
 
 
 class _StateMixin:
@@ -360,7 +367,9 @@ class _StateMixin:
         pure ``body_q[base_link]`` read with no quat math.
 
         Twist is finite-differenced against the previous call's pose,
-        transformed into the base_link frame.
+        transformed into the base_link frame; angular left at 0.  With
+        ``sim_time_stamps``: planar twist in base_footprint (yaw-only
+        rotation) including ``angular.z``, over exactly one physics step.
         """
         if self._state_0 is None or getattr(self._state_0, "body_q", None) is None or not self._body_paths:
             return None
@@ -390,6 +399,26 @@ class _StateMixin:
         # Twist via finite difference (pose7 prev cached on self)
         prev = getattr(self, "_odom_prev", None)
         twist6 = np.zeros(6, dtype=np.float64)
+        if getattr(self, "_sim_time_stamps", False):
+            # Both poses are this and the previous step's state (read_latest,
+            # GPU-synced), dt is exactly one physics step -- no stale-slot
+            # spikes (B9).  Expressed in base_footprint, the Odometry child
+            # frame: rotate by yaw only; angular.z = yaw rate.
+            if prev is not None:
+                prev_pose, prev_t = prev
+                dt = sim_time - prev_t
+                if dt > 1e-9:
+                    yaw0 = _yaw_of(prev_pose[3:7])
+                    dyaw = math.atan2(math.sin(_yaw_of(pose7[3:7]) - yaw0), math.cos(_yaw_of(pose7[3:7]) - yaw0))
+                    ym = yaw0 + 0.5 * dyaw
+                    dx, dy, dz = (pose7[:3] - prev_pose[:3]) / dt
+                    c, s_ = math.cos(ym), math.sin(ym)
+                    twist6[:] = (c * dx + s_ * dy, -s_ * dx + c * dy, dz, 0.0, 0.0, dyaw / dt)
+                else:
+                    twist6[:] = getattr(self, "_odom_twist_prev", twist6)
+            self._odom_twist_prev = twist6.copy()
+            self._odom_prev = (pose7.copy(), sim_time)
+            return pose7, twist6
         if prev is not None:
             prev_pose, prev_t = prev
             dt = max(sim_time - prev_t, 1e-6)

@@ -46,16 +46,26 @@ public:
     const std::vector<double> & positions,
     const std::vector<double> & efforts);
 
+  // Stamps the receipt with steady_clock seconds.
   void on_cmd_4ws(
     const std::vector<std::string> & names,
     const std::vector<double> & positions,
     const std::vector<double> & velocities);
 
+  // Same, with a caller-provided receipt stamp (sim_time_stamps: the sim
+  // time of the latest published step; the timeout check then runs on sim
+  // time, see engine/newton/control.py).  Must be > 0 (0 = never received).
+  void on_cmd_4ws(
+    const std::vector<std::string> & names,
+    const std::vector<double> & positions,
+    const std::vector<double> & velocities,
+    double stamp_s);
+
   // Snapshot the accumulated dictionaries to the consumer. The internal
   // maps are *not* cleared — joint setpoints stick until a new ROS message
   // overrides them (matching the ros_control "latest command" semantics).
-  // The 4WS stamp is the wall-clock seconds (steady_clock) of the last
-  // /cmd_4ws message at receive time.
+  // The 4WS stamp is the receive time of the last /cmd_4ws message:
+  // steady_clock seconds, or sim time with sim_time_stamps.
   void swap_out(
     std::unordered_map<std::string, double> & cmd_positions_out,
     std::unordered_map<std::string, double> & cmd_efforts_out,

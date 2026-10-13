@@ -126,8 +126,13 @@ ServoNode::ServoNode(const rclcpp::NodeOptions & options)
 
   cmd_4ws_pub_ = create_publisher<sensor_msgs::msg::JointState>("cmd_4ws", rclcpp::QoS(1));
 
+  // Node-clock timer: with use_sim_time:=true the control tick (and the
+  // MPC's fixed dt = 1/control_rate) runs on sim time, so the per-tick
+  // steer/drive rate limits stay correct when the sim runs below real time.
+  // Without use_sim_time the node clock is the system clock -> wall rate as
+  // before.
   const auto period = std::chrono::duration<double>(1.0 / control_rate);
-  control_timer_ = create_wall_timer(
+  control_timer_ = create_timer(
     std::chrono::duration_cast<std::chrono::nanoseconds>(period),
     std::bind(&ServoNode::onTimer, this));
 
