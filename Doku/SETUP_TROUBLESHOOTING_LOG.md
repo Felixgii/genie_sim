@@ -287,6 +287,68 @@ einen Tick später.
   anfangs keine Werte auf `/rtf`, und `tf2_echo` fand `base_link` nicht. Lösung: Login-Shell
   `docker exec -u isaac-sim geniesim3 bash -lc '…'` bzw. `geniesim docker into`.
 
+### B7 — Chassis-Servo: Restbewegung nach Twist-Timeout (Code-Fix, 2026-10-13)
+
+**Symptom:** Servo standalone (`genie_sim_chassis_servo_node`, `genie_g2.yaml`, `OptimalServo`).
+Erst `/cmd_twist` mit `linear.x=0.2`, dann senden stoppen, dann `angular.z=0.5`. Der Roboter
+dreht sich nicht auf der Stelle, sondern fährt eine Vorwärtskurve. Mit einem 0-Twist
+dazwischen funktioniert es.
+
+**Messung (vorher):** In den ersten `/cmd_4ws`-Ticks nach dem zweiten Befehl liegen die
+Radgeschwindigkeiten bei 2,66/3,06 rad/s, also beim alten Vorwärtswert 2,857 rad/s
+(0,2 m/s / 0,07 m). Danach bleibt der Servo dauerhaft in einer Vorwärtskurve hängen
+(Lenkung ±0,30/±0,19 statt ±0,81 rad). Odometrie: +0,105 m vorwärts in 4 s bei vx≈0,21 m/s.
+Mit 0-Twist dazwischen: −0,002 m, Spin-Stellung ±0,808 rad.
+
+**Ursache:** Nach `twist_timeout_ms` (1000 ms) liefert der Servo `nullopt`. Es geht kein
+`/cmd_4ws` mehr raus, und die Engine bremst die Räder (`cmd_4ws_timeout_s` = 0,1 s).
+`ServoCore::prev_cmd_` behält aber die letzten Radgeschwindigkeiten. Beim nächsten Twist
+startet `OptimalServo` mit diesen Werten
+([optimal_servo.cpp:37-41](../source/geniesim_ros/src/ros_ws/src/genie_sim_ros_control/genie_sim_controllers/src/plugins/optimal_servo.cpp#L37-L41)),
+die Lenkwinkel dagegen mit dem Ist-Zustand. Weil die Geschwindigkeiten über 1e-2 liegen,
+wird in `getDirectCmd` die Regel „erst lenken, dann fahren“ übersprungen. Pro Tick darf sich die
+Geschwindigkeit nur um 0,2 rad/s ändern, deshalb landet der MPC in der Vorwärtskurve.
+
+**Fix:** [servo_core.cpp](../source/geniesim_ros/src/ros_ws/src/genie_sim_ros_control/genie_sim_controllers/src/servo_core.cpp)
+`ServoCore::tick`: Wenn der Twist abgelaufen ist **und** der Servo `nullopt` liefert, werden
+`prev_cmd_.drive_speeds` auf 0 gesetzt. Die Lenkwinkel bleiben stehen. Der Fix greift für alle
+Servo-Modi und beide Wrapper (`servo_node`, `chassis_servo_controller`, gemeinsame
+`libgenie_sim_controllers_servo_core.so`). Die Bedingung `nullopt` ist Absicht:
+`SelftestServo` und `ParkingServo` senden auch ohne Twist. Würde dort `prev` jeden Tick genullt,
+würde `ServoCore::limit()` den Selftest auf 0,2 rad/s pro Tick deckeln.
+Build: `geniesim ros build dev` im Container (C++, Symlink-Install allein reicht nicht).
+
+**Ergebnis (nachher, RTF 0,14–0,18):**
+
+| Test | vorher | nachher |
+|---|---|---|
+| x=0.2 → 3 s Pause → z=0.5 | +0,105 m vorwärts, Vorwärtskurve | −0,001 bis −0,002 m, Spin-Stellung (3 Läufe) |
+| x=0.2 → z=0.5 ohne Pause | – | erste Ticks identisch zu vorher (2,66/3,06 …), max. `/cmd_4ws`-Lücke 11 ms → Fix-Zweig nicht aktiv |
+| rückwärts / vorwärts | −0,117 / +0,114 m | −0,107 / +0,097 m |
+| seitwärts −y (Räder schon quer) | −0,078 m | −0,096 m |
+| seitwärts +y aus dem Stand, 20 s | – | ~4 s Umlenken, dann +0,49 m |
+| GeneralServo, SpinServo, ParkingServo | – | unverändert funktionsfähig (Parking hält Kreuzstellung, sendet weiter) |
+
+**Offen (schon vorher vorhanden, nicht durch den Fix verursacht):**
+- **Kurve aus der Spin-Stellung:** `vx=0.15, wz=0.3` direkt nach einer Drehung endet in einer
+  falschen Gleichgewichtslage (Lenkung −0,13/0,33/0,92/−1,29). Das passiert genauso beim
+  durchgehenden Wechsel ohne Pause, also auf dem unveränderten Codepfad. Nach dem Fix gilt das auch
+  für den Pause-Fall. Vorher landete der Pause-Fall dort zufällig richtig. Aus anderen
+  Startstellungen (z. B. nach 0-Twist) wird die Kurve korrekt angefahren.
+- **Seitwärts aus dem Stand braucht Anlaufzeit (kein Fehler):** Die Lenkung braucht von 0 auf
+  ±1,571 rad etwa 4 s Wanduhrzeit. Bis dahin hält der MPC die Fahrgeschwindigkeit bei 0, danach
+  fährt der Roboter mit 2,14 rad/s (0,15 m/s) seitwärts (+0,49 m in 20 s, mit Fix). Ein erster
+  4-s-Test war dafür zu kurz und wurde zunächst fälschlich als „keine Bewegung“ gewertet.
+  Langtest Kurve zur Kontrolle: Die falsche Lage bleibt 18 s konstant, die Ist-Lenkung entspricht
+  dem Befehl. Das ist also keine langsame Konvergenz.
+- **Hänger am Lenkanschlag (nur ohne Fix beobachtet):** Nach −y-Fahrt + Pause blieb der
+  Original-Servo bei ±1,571 rad stehen, auch Drehen und 0-Twist halfen nicht. Mit Fix trat das
+  in derselben Sequenz nicht auf.
+- `use_drive_ltd` (in `genie_g2.yaml` aus): Der Tracking-Differentiator hält nach dem Timeout
+  ebenfalls den alten Zustand und wird durch den Fix nicht zurückgesetzt.
+- Testumgebung: Nach mehreren Läufen stand der Roboter bei x≈0,22 m an einem Hindernis
+  (Vorderräder blockiert). Die Tests oben laufen deshalb jeweils ab einem frischen Sim-Start.
+
 ---
 
 ## Anhang: Betrieb
@@ -332,9 +394,11 @@ Beim ersten Start kompiliert Warp die CUDA-Kernel (mehrere Minuten, danach gecac
 | `source/geniesim_ros/.../config/scene_pnp_g2_op.yaml` | Block `newton.sensors.laser_scan` (B6) |
 | `source/geniesim_ros/.../genie_sim_engine/AGENTS.md` | Datei-Layout um `laser_scan.py` ergänzt |
 | `Doku/scan_test_plugin.py` (neu) | Test-Plugin bewegtes Objekt (B6), nur temporär aktiv |
+| `source/geniesim_ros/.../genie_sim_controllers/src/servo_core.cpp` | `prev_cmd_.drive_speeds` bei Twist-Timeout auf 0 (B7) |
 
 Backups in WSL: `~/genie_sim_crlf_backup_2026-10-11.tar.gz`, `~/assemble_robot.py.orig_2026-10-11`,
-`~/genie_sim_orig_2026-10-11/`, `~/genie_sim/scene_pnp_g2_op.yaml.bak_2026-10-11`.
+`~/genie_sim_orig_2026-10-11/`, `~/genie_sim/scene_pnp_g2_op.yaml.bak_2026-10-11`,
+`~/servo_core.cpp.orig_2026-10-13`.
 
 ### Lessons Learned
 

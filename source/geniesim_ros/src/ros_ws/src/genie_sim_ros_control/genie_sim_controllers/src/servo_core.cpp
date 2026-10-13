@@ -209,7 +209,13 @@ std::optional<WheelCommand> ServoCore::tick(double now_s)
   }
 
   auto cmd_opt = active_servo_->update(twist_opt, state_opt, prev_cmd_);
-  if (!cmd_opt.has_value()) {return std::nullopt;}
+  if (!cmd_opt.has_value()) {
+    // Twist timed out and nothing is published: the engine brakes the drive
+    // wheels (cmd_4ws_timeout_s), so the next command has to start from rest,
+    // not from the last published speeds. Steer angles are held.
+    if (!twist_opt.has_value()) {prev_cmd_.drive_speeds.fill(0.0f);}
+    return std::nullopt;
+  }
 
   auto cmd = cmd_opt.value();
   limit(cmd, prev_cmd_);
