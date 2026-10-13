@@ -47,8 +47,18 @@ Design notes:
   outline.  At runtime any remaining robot hit (e.g. an arm swinging
   into the plane) is reported as no-return (+inf).
 * **Timing**: gated on wall clock and stamped with the rclpy node's
-  wall clock, matching the C++ bridge (``node_->now()``).  One
-  device sync per scan (the ``numpy()`` readback).
+  wall clock, matching the C++ bridge (``node_->now()``).  The stamp is
+  taken when the cast is enqueued (= the state the rays see).
+* **Async readback** (no device sync in the physics loop): a due scan
+  enqueues raycast + ``wp.copy`` into pinned host buffers + a
+  ``wp.Event`` on the physics stream and returns.  Later ticks poll
+  ``Event.is_complete`` (non-blocking) and publish once it fired --
+  typically one physics tick later.  No new scan is enqueued while one
+  is pending, so the host buffers are never written while read.  Unlike
+  ``async_mirror.py`` this does not rely on wall-time separation: if
+  the GPU falls behind, the scan arrives later instead of stalling the
+  loop.  A synchronous ``numpy()`` readback (old behaviour: drains the
+  whole queued GPU backlog every scan) is only used for calibration.
 * No noise model, no beam divergence, no intensities.
 
 ``GENIESIM_LASER_SCAN_DEBUG=1`` logs, once, every non-robot shape the
@@ -160,6 +170,18 @@ class LaserScanSensor:
         self._rays = wp.zeros((1, 1, self._n, 2), dtype=wp.vec3f, device=device)
         self._upload_rays()
 
+        # --- async readback (see module doc) ---
+        self._depth_host = wp.empty(self._depth.shape, dtype=self._depth.dtype, device="cpu", pinned=True)
+        self._shape_host = wp.empty(self._shape_idx.shape, dtype=self._shape_idx.dtype, device="cpu", pinned=True)
+        self._depth_view = self._depth_host.numpy()
+        self._shape_view = self._shape_host.numpy()
+        self._done = wp.Event(device)
+        self._pending_stamp: Any = None  # header stamp of the enqueued scan; None = nothing pending
+        self._pending_ticks = 0
+        self._lat_sum = 0
+        self._lat_max = 0
+        self._lat_n = 0
+
         # --- ROS ---
         node = _get_or_create_node()
         self._node = node
@@ -228,7 +250,8 @@ class LaserScanSensor:
         rays[0, 0, :, 1, :] = self._dirs  # direction
         self._rays.assign(rays)
 
-    def _cast(self, state: Any) -> tuple[np.ndarray, np.ndarray]:
+    def _enqueue_cast(self, state: Any) -> None:
+        """Launch BVH refit + scanner pose + raycast; no host sync."""
         self._model.bvh_refit_shapes(state)
         wp.launch(
             _scanner_pose_kernel,
@@ -243,10 +266,16 @@ class LaserScanSensor:
             depth_image=self._depth,
             shape_index_image=self._shape_idx,
         )
+
+    def _cast(self, state: Any) -> tuple[np.ndarray, np.ndarray]:
+        """Synchronous cast (calibration only): ``numpy()`` waits for the GPU."""
+        self._enqueue_cast(state)
+        return self._classify(self._depth.numpy()[0, 0, 0], self._shape_idx.numpy()[0, 0, 0])
+
+    def _classify(self, depth: np.ndarray, shape: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         # A miss leaves ClearData's values: shape index NO_HIT (0xFFFFFFFF)
         # and depth 0.0 (not negative) -- so classify on the shape index.
-        depth = self._depth.numpy()[0, 0, 0]
-        shape = self._shape_idx.numpy()[0, 0, 0].astype(np.int64)
+        shape = shape.astype(np.int64)
         miss = shape >= self._model.shape_count
         shape[miss] = self._model.shape_count
         depth = np.where(miss, -1.0, depth)
@@ -316,6 +345,12 @@ class LaserScanSensor:
         )
 
     def maybe_publish(self, state: Any) -> None:
+        """Called every physics tick; never waits for the GPU (see module doc)."""
+        if self._pending_stamp is not None:
+            self._pending_ticks += 1
+            if not self._done.is_complete:
+                return
+            self._publish_pending()
         now = time.monotonic()
         if now < self._next_t:
             return
@@ -323,13 +358,33 @@ class LaserScanSensor:
         self._next_t = max(self._next_t + self._period, now + 0.5 * self._period)
         if not self._calibrated:
             self._calibrate(state)
-        depth, shape = self._cast(state)
+        self._enqueue_cast(state)
+        wp.copy(self._depth_host, self._depth)
+        wp.copy(self._shape_host, self._shape_idx)
+        wp.record_event(self._done)
+        self._pending_stamp = self._node.get_clock().now().to_msg()
+        self._pending_ticks = 0
+
+    def _publish_pending(self) -> None:
+        depth, shape = self._classify(self._depth_view[0, 0, 0], self._shape_view[0, 0, 0])
         ranges = (self._offset + depth).astype(np.float32)
         no_return = (depth < 0.0) | self._robot_shape[shape] | (ranges > self._range_max)
         ranges[no_return] = np.inf
-        self._msg.header.stamp = self._node.get_clock().now().to_msg()
+        self._msg.header.stamp = self._pending_stamp
         self._msg.ranges = ranges.tolist()
         self._pub.publish(self._msg)
+        self._pending_stamp = None
+
+        # Readback latency in physics ticks, logged about once a minute.
+        self._lat_sum += self._pending_ticks
+        self._lat_max = max(self._lat_max, self._pending_ticks)
+        self._lat_n += 1
+        if self._lat_n >= 600:
+            self._logger.info(
+                f"[newton-standalone] laser_scan: async readback latency over {self._lat_n} scans: "
+                f"mean={self._lat_sum / self._lat_n:.2f} max={self._lat_max} physics ticks"
+            )
+            self._lat_sum = self._lat_max = self._lat_n = 0
 
 
 def maybe_create_laser_scan(engine: Any) -> Optional[LaserScanSensor]:
