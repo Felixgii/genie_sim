@@ -129,6 +129,10 @@ RUN rosdep init && rosdep update --rosdistro jazzy --include-eol-distros 2>&1 | 
 # PIP_BREAK_SYSTEM_PACKAGES=1 (set above) lifts Ubuntu 24.04's PEP 668
 # restriction. The NVIDIA index is always supplied as --extra-index-url
 # because the isaacsim wheels live only there.
+#
+# Pinned: unpinned, the same repo commit resolved to Newton 1.5.0 in one
+# build and 1.6.1 (isaacsim 6.2.0.0) in a later one, and Newton 1.6 renamed
+# the control buffers the engine uses (see engine/newton/newton_api.py).
 # ------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     if [ -n "${PIP_INDEX_URL}" ]; then \
@@ -136,7 +140,8 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     fi && \
     python3 -m pip install --upgrade --ignore-installed pip && \
     python3 -m pip install --upgrade --ignore-installed \
-        "isaacsim[all,extscache]" \
+        "isaacsim[all,extscache]==6.2.0.0" \
+        "newton==1.6.1" \
         --extra-index-url "${ISAACSIM_PYPI_INDEX}"
 
 # Pre-accept EULA for Isaac Sim 6.0 (OMNI_KIT_ACCEPT_EULA path)
