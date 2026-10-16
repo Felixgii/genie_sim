@@ -1567,6 +1567,24 @@ def _convert_urdf_to_usd_60(
         if imported_root != usd_path and os.path.isfile(imported_root):
             os.replace(imported_root, usd_path)
 
+        # Upstream bug: the transformer authors the ``Physics`` variantSet
+        # (mujoco | none | physics | physx) on the robot prim but no
+        # selection, although docs/asset_consumption.md specifies ``physx``
+        # as the default.  Without it no physics payload composes: 0 rigid
+        # bodies / joints, PhysX loads an empty robot and Newton aborts
+        # ("at least one joint").  ``physx`` is the variant all engine paths
+        # consume (newton-direct included), and the bake cache is keyed by
+        # URDF only, so the selection must not depend on the launcher.
+        # Must run before the post-passes below, which walk physics prims.
+        if os.path.isfile(usd_path):
+            from pxr import Sdf
+
+            layer = Sdf.Layer.FindOrOpen(usd_path)
+            robot_spec = layer.GetPrimAtPath(Sdf.Path.absoluteRootPath.AppendChild(layer.defaultPrim))
+            if robot_spec and not robot_spec.variantSelections.get("Physics"):
+                robot_spec.variantSelections["Physics"] = "physx"
+                layer.Save()
+
         # Apply the selective collision policy AGAINST THE FINAL
         # robot.usda. Overrides authored here land in the robot.usda
         # root layer (AS3 root) and compose over the payloads at load
