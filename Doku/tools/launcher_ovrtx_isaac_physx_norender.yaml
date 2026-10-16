@@ -1,0 +1,11 @@
+# Messvariante: wie launcher_ovrtx_isaac_physx, aber ohne Render-Node (keine Kamera-Topics)
+launcher:
+  physics:
+    engine: genie_sim_engine
+    engines:
+      genie_sim_engine:
+        package: genie_sim_engine
+        executable: genie_sim_engine_isaacsim.py
+        name: genie_sim_engine
+    industrial_bridge: ""
+  renders: []
