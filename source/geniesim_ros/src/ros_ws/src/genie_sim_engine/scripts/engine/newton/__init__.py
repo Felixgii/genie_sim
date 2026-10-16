@@ -10,6 +10,11 @@ concrete engine class.  For the Kit viewport with Newton physics, use
 internally.
 """
 
-from engine.newton.engine import NewtonHeadlessEngine
+from engine.newton import newton_api
+
+# Before anything builds a model: Newton 1.6.1 renamed the control buffers (see newton_api).
+newton_api.install()
+
+from engine.newton.engine import NewtonHeadlessEngine  # noqa: E402
 
 __all__ = ["NewtonHeadlessEngine"]
